@@ -304,32 +304,65 @@ int l_ndarray_new(lua_State* L) {
   return 1;
 }
 
-/* Multi-dimensional access: arr(i, j, ...) */
+/* Multi-dimensional access: arr(i, j, ...) for GET and arr(i, j, ..., val) for SET */
 static int l_ndarray_call(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
-  int n_args = lua_gettop(L) - 1; /* First arg is the array itself */
+  int total_args = lua_gettop(L) - 1; /* Exclude the array itself */
 
-  if (n_args != arr->ndims) {
-    return luaL_error(L, "numlu: expected %d indices, got %d", arr->ndims, n_args);
+  /* Determine if we are in Setter Mode (ndims indices + 1 value) */
+  int is_setter = (total_args == arr->ndims + 1);
+
+  if (total_args != arr->ndims && !is_setter) {
+    return luaL_error(L, "numlu: expected %d indices (get) or %d indices + value (set), got %d", 
+                      arr->ndims, arr->ndims, total_args);
   }
 
-  /* Calculate flat index using strides */
+  /* 1. Calculate flat index using strides (up to ndims) */
   size_t flat_idx = 0;
   for (int i = 0; i < arr->ndims; i++) {
     lua_Integer idx = luaL_checkinteger(L, i + 2);
     
-    /* 1-based bounds check for each dimension */
+    /* 1-based bounds check */
     if (idx < 1 || idx > (lua_Integer)arr->shape[i]) {
       return luaL_error(L, "numlu: index %d out of bounds for dimension %d (size %d)", 
                         (int)idx, i + 1, (int)arr->shape[i]);
     }
-    
-    /* Accumulate offset: (index - 1) * stride */
     flat_idx += (size_t)(idx - 1) * arr->strides[i];
   }
 
-  /* For now, we only implement the GETTER in __call */
-  /* (Setter logic can be added by checking if an extra value is passed) */
+  /* 2. SETTER MODE */
+  if (is_setter) {
+    int val_idx = lua_gettop(L); /* The value is the last argument */
+
+    if (arr->dtype->id == NUMLU_TYPE_F32 || arr->dtype->id == NUMLU_TYPE_F64) {
+      double val = luaL_checknumber(L, val_idx);
+      if (arr->dtype->id == NUMLU_TYPE_F32)
+        ((float*)arr->data)[flat_idx] = (float)val;
+      else
+        ((double*)arr->data)[flat_idx] = val;
+    } 
+    else {
+      /* Complex Setter: accepts Lua number or lcomplex userdata */
+      double complex val;
+      if (lua_isnumber(L, val_idx)) {
+        val = lua_tonumber(L, val_idx) + 0.0 * I;
+      }
+      else {
+        double complex* z = luaL_checkudata(L, val_idx, LCOMPLEX_METATABLE);
+        val = *z;
+      }
+
+      if (arr->dtype->id == NUMLU_TYPE_C64) {
+        ((float complex*)arr->data)[flat_idx] = (float)creal(val) + (float)cimag(val) * I;
+      }
+      else {
+        ((double complex*)arr->data)[flat_idx] = val;
+      }
+    }
+    return 0; /* Setters return nothing */
+  }
+
+  /* 3. GETTER MODE */
   switch (arr->dtype->id) {
   case NUMLU_TYPE_F32:
     {
@@ -344,12 +377,13 @@ static int l_ndarray_call(lua_State* L) {
   case NUMLU_TYPE_C64:
   case NUMLU_TYPE_C128:
     {
+      /* Create lcomplex-compatible userdata */
       double complex* res = lua_newuserdatauv(L, sizeof(double complex), 0);
       luaL_setmetatable(L, LCOMPLEX_METATABLE);
       if (arr->dtype->id == NUMLU_TYPE_C64) {
 	float complex c = ((float complex*)arr->data)[flat_idx];
 	*res = (double)crealf(c) + (double)cimagf(c) * I;
-        }
+      }
       else {
 	*res = ((double complex*)arr->data)[flat_idx];
       }

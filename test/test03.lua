@@ -1,4 +1,5 @@
 local numlu = require("numlu")
+local complex = require("lcomplex")
 
 print("--- Test 1: Multi-Dimensional Creation ---")
 local matrix = numlu.zeros({3, 4}, numlu.float64)
@@ -9,13 +10,9 @@ local s = matrix.shape
 print("  shape:  {" .. s[1] .. ", " .. s[2] .. "}")
 assert(s[1] == 3 and s[2] == 4, "Shape mismatch!")
 
-print("\n--- Test 2: Methods vs Operators ---")
--- Classic method
+print("\n--- Test 2: Methods vs Operators (Flat) ---")
 matrix:at(1, 10.5)
--- New: Unified __newindex (flat)
 matrix[12] = 99.9
-
--- New: Unified __index (flat)
 print("  Value at [1]:  " .. matrix[1])
 print("  Value at [12]: " .. matrix[12])
 assert(matrix[1] == 10.5 and matrix[12] == 99.9, "Index operator failed")
@@ -34,21 +31,35 @@ local mat = numlu.zeros({50, 20}, numlu.float64)
 print("  2D Matrix (50x20) #mat: " .. #mat)
 assert(#mat == 50, "Length operator failed")
 
-print("\n--- Test 5: Multi-Dimensional Access (Call) ---")
+print("\n--- Test 5: Multi-Dimensional Call (Get/Set) ---")
 local m2d = numlu.zeros({3, 3}, numlu.float64)
 
--- Set values via flat index for setup
-m2d[1] = 1.1 -- Position (1,1)
-m2d[2] = 1.2 -- Position (1,2)
-m2d[4] = 2.1 -- Position (2,1)
-m2d[9] = 3.3 -- Position (3,3)
+-- New: Set values via multi-dim call: mat(r, c, val)
+m2d(1, 1, 1.1)
+m2d(1, 2, 1.2)
+m2d(2, 1, 2.1)
+m2d(3, 3, 3.3)
 
--- Test multi-dim getter via __call
 print("  Access (1,1): " .. m2d(1, 1))
-print("  Access (1,2): " .. m2d(1, 2))
 print("  Access (2,1): " .. m2d(2, 1))
 print("  Access (3,3): " .. m2d(3, 3))
 
-assert(m2d(2, 1) == 2.1, "Multi-dim call access failed")
+assert(m2d(2, 1) == 2.1, "Multi-dim call setter/getter failed")
+
+-- Bounds Check Test
+local ok, err = pcall(function() m2d(4, 1, 0) end)
+print("  Bounds Check (expected error): " .. (ok and "Failed" or "OK (" .. err:match("out of bounds") .. ")"))
+
+print("\n--- Test 6: Complex Multi-Dim Call ---")
+local cmat = numlu.zeros({2, 2}, "complex128")
+local z = complex.new(5, -2)
+
+cmat(1, 2, z)
+cmat(2, 2, 10.5) -- Set real number to complex array
+
+print("  Complex (1,2): " .. tostring(cmat(1, 2)))
+print("  Complex (2,2): " .. tostring(cmat(2, 2)))
+
+assert(cmat(1, 2):real() == 5 and cmat(1, 2):imag() == -2, "Complex multi-dim call failed")
 
 print("\n--- All Tests Passed! ---")
