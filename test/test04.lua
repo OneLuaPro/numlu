@@ -89,4 +89,35 @@ view(2, 88.0) -- This is M(1, 2)
 assert_eq(M(1, 1), 99.0, "Writing to view affects M(1,1)")
 assert_eq(M(1, 2), 88.0, "Writing to view affects M(1,2)")
 
+-- TEST 10: Partial Indexing (Implied ":" for missing dimensions)
+print("--- Testing Partial Indexing ---")
+-- M(2) should be equivalent to M(2, ":")
+local partial = M(2) 
+assert_eq(partial.ndims, 1, "Partial indexing collapses indexed dim")
+assert_eq(partial.size, 4, "Partial indexing keeps full remaining dim")
+assert_eq(partial(1), 5, "M(2)(1) is M(2,1) = 5")
+assert_eq(partial(4), 8, "M(2)(4) is M(2,4) = 8")
+
+-- TEST 11: N-Dimensionality (3D Array Test)
+print("--- Testing 3D Array & Slicing ---")
+local T = numlu.zeros({2, 3, 4}, "float32")
+T(1, 1, 1, 100.0)
+T(2, 1, 1, 200.0)
+
+-- Partial indexing on 3D -> 2D view
+local layer1 = T(1) 
+assert_eq(layer1.ndims, 2, "T(1) results in 2D view")
+assert_eq(layer1(1, 1), 100.0, "Value in layer1(1,1) is T(1,1,1)")
+
+-- Mixing scalar, slice and partial indexing: T(2, "1:2") -> T(2, "1:2", ":")
+local sub_3d = T(2, "1:2")
+assert_eq(sub_3d.ndims, 2, "T(2, '1:2') results in 2D view (dim 1 collapsed)")
+assert_eq(sub_3d.size, 8, "Sub-view size is 2x4 = 8")
+assert_eq(sub_3d(1, 1), 200.0, "Value in sub_3d(1,1) is T(2,1,1)")
+
+-- TEST 12: Setter Guard (Should fail with partial indices)
+print("--- Testing Setter Guards ---")
+local ok_set, err_set = pcall(function() T(1, 1, 999.0) end)
+assert_eq(ok_set, false, "Setter with missing indices must fail (expected 3, got 2)")
+
 print("\n--- ALL SLICING TESTS PASSED ---")

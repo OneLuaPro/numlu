@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <complex.h>
+#include <stdbool.h>
 
 /* Forward declaration */
 static int parse_slice_string(const char *s, long max_len, long *start, long *stop, long *step);
@@ -365,63 +366,90 @@ int l_ndarray_new(lua_State* L) {
   return 1;
 }
 
-/* Multi-dimensional access: arr(i, j, ...) for GET and arr(i, j, ..., val) for SET */
+/* 
+ * Multi-dimensional access: 
+ * - GET: arr(i, j, ...) -> returns scalar or view (if slicing/partial indexing)
+ * - SET: arr(i, j, ..., val) -> sets scalar value
+ */
 static int l_ndarray_call(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
-  int total_args = lua_gettop(L) - 1; /* Exclude the array itself */
+  int total_args = lua_gettop(L) - 1; /* Total arguments provided in Lua */
 
-  /* Determine if we are in Setter Mode (ndims indices + 1 value) */
-  int is_setter = (total_args == arr->ndims + 1);
+  /* 
+   * Determine Mode:
+   * A setter call must provide exactly ndims + 1 (the value) arguments.
+   * Partial indexing is only allowed for getters (creating views).
+   */
+  bool is_setter = (total_args == (int)arr->ndims + 1);
 
-  if (total_args != arr->ndims && !is_setter) {
-    return luaL_error(L, "numlu: expected %d indices (get) or %d indices + value (set), got %d", 
-                      arr->ndims, arr->ndims, total_args);
+  /* Guard against too many arguments */
+  if (!is_setter && total_args > (int)arr->ndims) {
+    return luaL_error(L, "numlu: too many indices (%d) for %d-D array", 
+                      total_args, (int)arr->ndims);
+  }
+
+  /* Setters require all dimensions to be explicitly indexed */
+  if (is_setter && total_args != (int)arr->ndims + 1) {
+    return luaL_error(L, "numlu: setter requires exactly %d indices plus a value", (int)arr->ndims);
   }
 
   /* 
-   * If at least one argument is a string (e.g. "1:5"), create a view instead of a scalar access.
+   * Check if we should enter Slicing Mode to create a View.
+   * Triggered if: 
+   * 1. At least one argument is a string (e.g., "1:5")
+   * 2. Fewer arguments than dimensions are provided (Partial Indexing)
    */
   int is_slicing = 0;
   if (!is_setter) {
-    for (int i = 0; i < total_args; i++) {
-      if (lua_type(L, i + 2) == LUA_TSTRING) {
-	is_slicing = 1;
-	break;
+    if (total_args < (int)arr->ndims) {
+      is_slicing = 1;
+    }
+    else {
+      for (int i = 0; i < total_args; i++) {
+        if (lua_type(L, i + 2) == LUA_TSTRING) {
+          is_slicing = 1;
+          break;
+        }
       }
     }
   }
 
   if (is_slicing) {
-    /* NEW: Count how many dimensions will remain (NumPy style)
-     * Strings (slices) keep a dimension, integers collapse it. */
+    /* Step 1: Calculate resulting dimensionality (NumPy-style) */
     int view_ndims = 0;
-    for (int i = 0; i < arr->ndims; i++) {
-      if (lua_type(L, i + 2) == LUA_TSTRING) {
-	long st, sp, sk;
-	if (parse_slice_string(lua_tostring(L, i + 2), arr->shape[i], &st, &sp, &sk) == SLICE_RANGE) {
-	  view_ndims++;
-	}
+    for (int i = 0; i < (int)arr->ndims; i++) {
+      if (i < total_args) {
+        if (lua_type(L, i + 2) == LUA_TSTRING) {
+          long st, sp, sk;
+          if (parse_slice_string(lua_tostring(L, i + 2), arr->shape[i], &st, &sp, &sk) == SLICE_RANGE) {
+            view_ndims++;
+          }
+        }
+        /* Scalar integers collapse the dimension */
+      }
+      else {
+        /* Missing indices in partial indexing are treated as ":" (Full Range) */
+        view_ndims++;
       }
     }
 
-    /* 1. Create the new view object */
+    /* Step 2: Initialize the new View object */
     numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
     luaL_getmetatable(L, "numlu.ndarray");
     lua_setmetatable(L, -2);
 
-    /* 2. Anchor the original array to prevent GC collection */
+    /* Anchor original array in uservalue to prevent GC collection while view exists */
     lua_pushvalue(L, 1); 
     lua_setiuservalue(L, -2, 1);
 
-    /* 3. Initialize view properties */
-    view->ndims = view_ndims; /* The view might have fewer dimensions than the original */
+    view->ndims = view_ndims;
     view->data = arr->data; 
     view->dtype = arr->dtype;
     view->is_view = 1;
     view->offset = arr->offset;
     view->size = 1;
-
-    /* Allocate metadata based on the NEW number of dimensions */
+    
+    /* Allocate metadata for the view */
     view->shape = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
     view->strides = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
 
@@ -429,60 +457,63 @@ static int l_ndarray_call(lua_State* L) {
       return luaL_error(L, "numlu: mkl_malloc failed for view metadata");
     }
 
+    /* Step 3: Populate view metadata and calculate offset */
     int target_dim = 0;
-    for (int i = 0; i < arr->ndims; i++) {
+    for (int i = 0; i < (int)arr->ndims; i++) {
       long start, stop, step;
       slice_type stype = SLICE_INVALID;
 
-      /* Get slice info from string or integer */
-      if (lua_type(L, i + 2) == LUA_TSTRING) {
-	stype = parse_slice_string(lua_tostring(L, i + 2), arr->shape[i], &start, &stop, &step);
-	if (stype == SLICE_INVALID) {
-	  return luaL_error(L, "numlu: slice out of bounds for dimension %d (max %d)", 
-			    i + 1, (int)arr->shape[i]);
-	}
+      if (i < total_args) {
+        if (lua_type(L, i + 2) == LUA_TSTRING) {
+          stype = parse_slice_string(lua_tostring(L, i + 2), arr->shape[i], &start, &stop, &step);
+          if (stype == SLICE_INVALID) {
+            return luaL_error(L, "numlu: slice out of bounds for dimension %d (max %d)", 
+                              i + 1, (int)arr->shape[i]);
+          }
+        }
+	else {
+          start = (long)luaL_checkinteger(L, i + 2);
+          stype = SLICE_SCALAR;
+          stop = start;
+          step = 1;
+        }
       }
       else {
-	start = (long)luaL_checkinteger(L, i + 2);
-        stype = SLICE_SCALAR;
-        stop = start; /* Not used for scalars but good practice */
+        /* Implied full range for partial indexing */
+        start = 1;
+        stop = (long)arr->shape[i];
         step = 1;
+        stype = SLICE_RANGE;
       }
 
-      /* CONVERT TO 0-BASED FOR INTERNAL C LOGIC */
-      long start_idx = start - 1;
+      long start_idx = start - 1; /* 0-based internal logic */
       
       if (stype == SLICE_RANGE) {
-	/* RANGE: Dimension persists in the new view */
-	view->offset += (size_t)start_idx * arr->strides[i];
-	view->strides[target_dim] = arr->strides[i] * (size_t)step;
+        view->offset += (size_t)start_idx * arr->strides[i];
+        view->strides[target_dim] = arr->strides[i] * (size_t)step;
 
-	/* Calculation for 1-based inclusive indices: */
-	long dim_size = (stop - start) / step + 1;
-	view->shape[target_dim] = (size_t)(dim_size < 0 ? 0 : dim_size);
-	view->size *= view->shape[target_dim];
-	target_dim++;
+        long dim_size = (stop - start) / step + 1;
+        view->shape[target_dim] = (size_t)(dim_size < 0 ? 0 : dim_size);
+        view->size *= view->shape[target_dim];
+        target_dim++;
       } 
-      else if (stype == SLICE_SCALAR) {
-	/* SCALAR: Dimension collapses (NumPy style) */
-	if (start < 1 || start > (long)arr->shape[i]) {
-	  return luaL_error(L, "numlu: index %ld out of bounds for dim %d", start, i + 1);
-	}
-	view->offset += (size_t)start_idx * arr->strides[i];
+      else { /* SLICE_SCALAR */
+        if (start < 1 || start > (long)arr->shape[i]) {
+          return luaL_error(L, "numlu: index %ld out of bounds for dim %d", start, i + 1);
+        }
+        view->offset += (size_t)start_idx * arr->strides[i];
       } 
-      else {
-	return luaL_error(L, "numlu: invalid index/slice at argument %d", i + 2);
-      }
     }
     return 1;
   }
 
-  /* 1. Calculate flat index using strides (up to ndims) */
+  /* --- Scalar Access Mode (Standard Getter/Setter) --- */
+
+  /* Calculate flat index using strides */
   size_t flat_idx = (size_t)arr->offset;
-  for (int i = 0; i < arr->ndims; i++) {
+  for (int i = 0; i < (int)arr->ndims; i++) {
     lua_Integer idx = luaL_checkinteger(L, i + 2);
     
-    /* 1-based bounds check */
     if (idx < 1 || idx > (lua_Integer)arr->shape[i]) {
       return luaL_error(L, "numlu: index %d out of bounds for dimension %d (size %d)", 
                         (int)idx, i + 1, (int)arr->shape[i]);
@@ -490,9 +521,8 @@ static int l_ndarray_call(lua_State* L) {
     flat_idx += (size_t)(idx - 1) * arr->strides[i];
   }
 
-  /* 2. SETTER MODE */
   if (is_setter) {
-    int val_idx = lua_gettop(L); /* The value is the last argument */
+    int val_idx = lua_gettop(L); 
 
     if (arr->dtype->id == NUMLU_TYPE_F32 || arr->dtype->id == NUMLU_TYPE_F64) {
       double val = luaL_checknumber(L, val_idx);
@@ -502,7 +532,6 @@ static int l_ndarray_call(lua_State* L) {
         ((double*)arr->data)[flat_idx] = val;
     } 
     else {
-      /* Complex Setter: accepts Lua number or lcomplex userdata */
       double complex val;
       if (lua_isnumber(L, val_idx)) {
         val = lua_tonumber(L, val_idx) + 0.0 * I;
@@ -512,17 +541,15 @@ static int l_ndarray_call(lua_State* L) {
         val = *z;
       }
 
-      if (arr->dtype->id == NUMLU_TYPE_C64) {
+      if (arr->dtype->id == NUMLU_TYPE_C64)
         ((float complex*)arr->data)[flat_idx] = (float)creal(val) + (float)cimag(val) * I;
-      }
-      else {
+      else
         ((double complex*)arr->data)[flat_idx] = val;
-      }
     }
-    return 0; /* Setters return nothing */
+    return 0;
   }
 
-  /* 3. GETTER MODE */
+  /* GETTER MODE */
   switch (arr->dtype->id) {
   case NUMLU_TYPE_F32:
     {
@@ -537,7 +564,6 @@ static int l_ndarray_call(lua_State* L) {
   case NUMLU_TYPE_C64:
   case NUMLU_TYPE_C128:
     {
-      /* Create lcomplex-compatible userdata */
       double complex* res = lua_newuserdatauv(L, sizeof(double complex), 0);
       luaL_setmetatable(L, LCOMPLEX_METATABLE);
       if (arr->dtype->id == NUMLU_TYPE_C64) {
