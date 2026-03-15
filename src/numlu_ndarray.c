@@ -12,6 +12,24 @@ static int parse_slice_string(const char *s, long max_len, long *start, long *st
 #define LCOMPLEX_METATABLE "complex number"
 
 /* 
+ * Helper: Checks if the array is C-contiguous (Row-Major).
+ * Returns 1 if contiguous, 0 otherwise.
+ */
+static int numlu_is_contiguous(numlu_ndarray* arr) {
+  if (arr->ndims == 0) return 1;
+    
+  size_t expected_stride = 1;
+  /* Check from last dimension to first (Right-to-Left) */
+  for (int i = arr->ndims - 1; i >= 0; i--) {
+    if (arr->strides[i] != expected_stride) {
+      return 0; /* Gap or non-standard layout detected */
+    }
+    expected_stride *= arr->shape[i];
+  }
+  return 1;
+}
+
+/* 
  * Helper: Converts a logical flat index (0-based) to the actual 
  * memory offset, taking strides and view-offsets into account.
  */
@@ -125,6 +143,10 @@ static int l_ndarray_index(lua_State* L) {
       lua_pushinteger(L, (lua_Integer)arr->shape[i]);
       lua_rawseti(L, -2, i + 1);
     }
+    return 1;
+  }
+  if (strcmp(key, "is_contiguous") == 0) {
+    lua_pushboolean(L, numlu_is_contiguous(arr));
     return 1;
   }
 
