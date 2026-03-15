@@ -294,80 +294,77 @@ static slice_type parse_slice_string(const char *s, long max_len, long *start, l
 
 /* Constructor: numlu.zeros(size|{shape}, dtype) */
 int l_ndarray_new(lua_State* L) {
-  int ndims = 0;
-  size_t total_size = 1;
-  size_t* shape = NULL;
-  size_t* strides = NULL;
+  /* 1. Preliminary DType check (before we do anything else) */
+  const numlu_dtype_info* dtype = numlu_dtype_check(L, 2);
+  
+  /* 2. Create Userdata EARLY for GC safety */
+  /* We use 1 User Value slot for the DType Singleton */
+  numlu_ndarray* arr = (numlu_ndarray*)lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
+  memset(arr, 0, sizeof(numlu_ndarray)); /* CRITICAL: Ensure all pointers are NULL for GC */
+  luaL_setmetatable(L, "numlu.ndarray");
 
-  /* 1. Parse Shape: Accept number (1D) or table (nD) */
+  /* 3. Anchor DType singleton to the ndarray immediately */
+  numlu_push_dtype(L, dtype); /* Singleton is now at -1, ndarray at -2 */
+  lua_setiuservalue(L, -2, 1); /* Anchor it, stack is now [ndarray] */
+
+  /* 4. Parse Shape and allocate Metadata (writing directly into 'arr') */
+  size_t total_size = 1;
+
   if (lua_isnumber(L, 1)) {
-    ndims = 1;
+    arr->ndims = 1;
     lua_Integer s = luaL_checkinteger(L, 1);
     if (s <= 0) return luaL_error(L, "numlu: size must be positive");
     
-    shape = (size_t*)mkl_malloc(sizeof(size_t), 64);
-    strides = (size_t*)mkl_malloc(sizeof(size_t), 64);
+    arr->shape = (size_t*)mkl_malloc(sizeof(size_t), 64);
+    arr->strides = (size_t*)mkl_malloc(sizeof(size_t), 64);
     
-    shape[0] = (size_t)s;
-    strides[0] = 1;
-    total_size = shape[0];
+    if (!arr->shape || !arr->strides) return luaL_error(L, "numlu: mkl_malloc failed for metadata");
+
+    arr->shape[0] = (size_t)s;
+    arr->strides[0] = 1;
+    total_size = arr->shape[0];
   } 
   else if (lua_istable(L, 1)) {
-    ndims = (int)lua_rawlen(L, 1);
-    if (ndims == 0) return luaL_error(L, "numlu: shape table cannot be empty");
+    arr->ndims = (int)lua_rawlen(L, 1);
+    if (arr->ndims == 0) return luaL_error(L, "numlu: shape table cannot be empty");
     
-    shape = (size_t*)mkl_malloc(ndims * sizeof(size_t), 64);
-    strides = (size_t*)mkl_malloc(ndims * sizeof(size_t), 64);
+    arr->shape = (size_t*)mkl_malloc(arr->ndims * sizeof(size_t), 64);
+    arr->strides = (size_t*)mkl_malloc(arr->ndims * sizeof(size_t), 64);
+    
+    if (!arr->shape || !arr->strides) return luaL_error(L, "numlu: mkl_malloc failed for metadata");
     
     /* Read dimensions and calculate total flat size */
-    for (int i = 1; i <= ndims; i++) {
+    for (int i = 1; i <= arr->ndims; i++) {
       lua_rawgeti(L, 1, i);
-      shape[i-1] = (size_t)luaL_checkinteger(L, -1);
-      total_size *= shape[i-1];
+      arr->shape[i-1] = (size_t)luaL_checkinteger(L, -1);
+      total_size *= arr->shape[i-1];
       lua_pop(L, 1);
     }
     
     /* Calculate Strides (Row-Major / C-Style) */
     size_t current_stride = 1;
-    for (int i = ndims - 1; i >= 0; i--) {
-      strides[i] = current_stride;
-      current_stride *= shape[i];
+    for (int i = arr->ndims - 1; i >= 0; i--) {
+      arr->strides[i] = current_stride;
+      current_stride *= arr->shape[i];
     }
   } 
   else {
     return luaL_typeerror(L, 1, "number or table");
   }
 
-  /* 2. Get DType and create Userdata (Lua 5.5: 1 User Value slot) */
-  const numlu_dtype_info* dtype = numlu_dtype_check(L, 2);
-  numlu_push_dtype(L, dtype);
-  numlu_ndarray* arr = lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
-  luaL_setmetatable(L, "numlu.ndarray");
-
-  lua_pushvalue(L, -2);        /* Copy the singleton (which is now at -2) */
-  lua_setiuservalue(L, -2, 1); /* Anchor it to the ndarray */
-  lua_remove(L, -2);           /* Remove the extra singleton copy, leave ndarray */
-
-  /* Remove the extra Singleton from stack, leaving only the ndarray */
-  lua_remove(L, -2);
-
-  /* 3. Allocate and zero-initialize MKL memory */
-  arr->data = mkl_malloc(total_size * dtype->itemsize, 64);
-  if (!arr->data) {
-    mkl_free(shape);
-    mkl_free(strides);
-    return luaL_error(L, "numlu: mkl_malloc failed for data");
-  }
-  memset(arr->data, 0, total_size * dtype->itemsize);
-
-  /* 4. Fill struct fields */
+  /* 5. Allocate and zero-initialize MKL memory */
   arr->size = total_size;
   arr->dtype = dtype;
-  arr->ndims = ndims;
-  arr->shape = shape;
-  arr->strides = strides;
-  arr->offset = 0;
+  arr->data = mkl_malloc(total_size * dtype->itemsize, 64);
+  
+  if (!arr->data) {
+    /* No need to mkl_free(shape) here! luaL_error triggers GC, which calls l_ndarray_gc */
+    return luaL_error(L, "numlu: mkl_malloc failed for data");
+  }
+  
+  memset(arr->data, 0, total_size * dtype->itemsize);
   arr->is_view = 0; /* Owner of the memory */
+  arr->offset = 0;
   
   return 1;
 }
@@ -380,6 +377,9 @@ int l_ndarray_new(lua_State* L) {
 static int l_ndarray_call(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
   int total_args = lua_gettop(L) - 1; /* Total arguments provided in Lua */
+
+  /* Ensure stack space for N-dimensional metadata + overhead */
+  luaL_checkstack(L, total_args + 10, "numlu: too many dimensions for stack");
 
   /* 
    * Determine Mode:
@@ -445,7 +445,15 @@ static int l_ndarray_call(lua_State* L) {
     lua_setmetatable(L, -2);
 
     /* Anchor original array in uservalue to prevent GC collection while view exists */
-    lua_pushvalue(L, 1); 
+    /* Optimize View-Chain: Anchor the original root owner if current is already a view */
+    if (arr->is_view) {
+      /* Get the root owner from current view */
+      lua_getiuservalue(L, 1, 1);
+    }
+    else {
+      /* Current is the owner */
+      lua_pushvalue(L, 1);
+    }
     lua_setiuservalue(L, -2, 1);
 
     view->ndims = view_ndims;
@@ -624,7 +632,16 @@ static int l_ndarray_at_squeeze(lua_State* L) {
   luaL_getmetatable(L, "numlu.ndarray");
   lua_setmetatable(L, -2);
     
-  lua_pushvalue(L, 1); /* Anchor original */
+  /* Anchor original array in uservalue to prevent GC collection while view exists */
+  /* Optimize View-Chain: Anchor the original root owner if current is already a view */
+  if (arr->is_view) {
+    /* Get the root owner from current view */
+    lua_getiuservalue(L, 1, 1);
+  }
+  else {
+    /* Current is the owner */
+    lua_pushvalue(L, 1);
+  }
   lua_setiuservalue(L, -2, 1);
 
   view->ndims = new_ndims;
@@ -632,8 +649,8 @@ static int l_ndarray_at_squeeze(lua_State* L) {
   view->dtype = arr->dtype;
   view->is_view = 1;
   view->offset = arr->offset;
-  view->size = arr->size;
-
+  view->size = 1; /* Reset size to recalculate from new shape */
+  
   view->shape = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
   view->strides = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
 
@@ -650,6 +667,7 @@ static int l_ndarray_at_squeeze(lua_State* L) {
     if (!skip && target < new_ndims) {
       view->shape[target] = arr->shape[i];
       view->strides[target] = arr->strides[i];
+      view->size *= view->shape[target]; /* Recalculate size */
       target++;
     }
   }
