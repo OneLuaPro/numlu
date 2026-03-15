@@ -21,4 +21,10 @@ typedef struct {
 void numlu_ndarray_register(lua_State* L);
 int l_ndarray_new(lua_State* L);
 
+typedef enum {
+  SLICE_INVALID = 0,
+  SLICE_SCALAR  = 1, /* Single index: dimension collapses (e.g., "5" or "-1") */
+  SLICE_RANGE   = 2  /* Range: dimension persists (e.g., "1:5" or ":") */
+} slice_type;
+
 #endif

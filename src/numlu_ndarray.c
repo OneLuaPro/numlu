@@ -4,6 +4,9 @@
 #include <string.h>
 #include <complex.h>
 
+/* Forward declaration */
+static int parse_slice_string(const char *s, long max_len, long *start, long *stop, long *step);
+
 /* Metatable name used by the lcomplex library */
 #define LCOMPLEX_METATABLE "complex number"
 
@@ -17,9 +20,12 @@ static int l_ndarray_gc(lua_State* L) {
     arr->data = NULL;
   }
   
-  /* 2. Always free metadata arrays (shape and strides) */
+  /* 
+   * 2. Always free metadata arrays (shape and strides).
+   * Note: Use free() if they were allocated with malloc() in l_ndarray_call.
+   */
   if (arr->shape) {
-    mkl_free(arr->shape);
+    mkl_free(arr->shape); 
     arr->shape = NULL;
   }
   if (arr->strides) {
@@ -228,6 +234,61 @@ static int l_ndarray_len(lua_State* L) {
   return 1;
 }
 
+/* 
+ * Helper function to parse a slicing string like "start:stop:step"
+ * Returns SLICE_RANGE if it contains a colon, SLICE_SCALAR otherwise.
+ */
+static slice_type parse_slice_string(const char *s, long max_len, long *start, long *stop, long *step) {
+  /* Default values: full range with step 1 */
+  *start = 1;
+  *stop = max_len;
+  *step = 1;
+
+  /* Check for range indicator (colon) before parsing */
+  int is_range = (strchr(s, ':') != NULL);
+
+  /* Special case: full dimension. Keep 1-based (start=1, stop=max_len). */
+  if (strcmp(s, ":") == 0) {
+    return SLICE_RANGE;
+  }
+
+  /* sscanf_s returns the number of successfully filled variables */
+  int count = sscanf_s(s, "%ld:%ld:%ld", start, stop, step);
+  if (count < 1) return SLICE_INVALID;
+
+  /* 
+   * FIXME: Reverse slicing (negative steps) is not yet supported.
+   * This requires negative strides and adjusted offset logic.
+   */
+  if (count >= 3 && *step < 1) {
+    /* For now, we force step to 1 or could return SLICE_INVALID */
+    *step = 1; 
+  }
+
+  /* Handle negative indices for 'start' (Lua-stack style: -1 is last) */
+  if (*start < 0) {
+    *start = max_len + *start + 1;
+  }
+    
+  /* Handle negative indices for 'stop' */
+  if (count >= 2 && *stop < 0) {
+    *stop = max_len + *stop + 1;
+  }
+
+  /* Bounds checking to prevent memory access errors */
+  if (*start < 1) *start = 1;
+  if (*start > max_len) *start = max_len;
+  if (*start < 1 || *start > max_len || *stop > max_len) {
+    /* Indices must be within 1 and max_len
+     * We could return SLICE_INVALID here, but a direct error message 
+     * helps the user find the bug in their Lua code immediately. */
+    return SLICE_INVALID; 
+  }
+  if (*stop < 0) *stop = 0; /* Resulting slice will be empty, which is okay */
+
+  return is_range ? SLICE_RANGE : SLICE_SCALAR;
+}
+
 /* Constructor: numlu.zeros(size|{shape}, dtype) */
 int l_ndarray_new(lua_State* L) {
   int ndims = 0;
@@ -317,8 +378,107 @@ static int l_ndarray_call(lua_State* L) {
                       arr->ndims, arr->ndims, total_args);
   }
 
+  /* 
+   * If at least one argument is a string (e.g. "1:5"), create a view instead of a scalar access.
+   */
+  int is_slicing = 0;
+  if (!is_setter) {
+    for (int i = 0; i < total_args; i++) {
+      if (lua_type(L, i + 2) == LUA_TSTRING) {
+	is_slicing = 1;
+	break;
+      }
+    }
+  }
+
+  if (is_slicing) {
+    /* NEW: Count how many dimensions will remain (NumPy style)
+     * Strings (slices) keep a dimension, integers collapse it. */
+    int view_ndims = 0;
+    for (int i = 0; i < arr->ndims; i++) {
+      if (lua_type(L, i + 2) == LUA_TSTRING) {
+	long st, sp, sk;
+	if (parse_slice_string(lua_tostring(L, i + 2), arr->shape[i], &st, &sp, &sk) == SLICE_RANGE) {
+	  view_ndims++;
+	}
+      }
+    }
+
+    /* 1. Create the new view object */
+    numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
+    luaL_getmetatable(L, "numlu.ndarray");
+    lua_setmetatable(L, -2);
+
+    /* 2. Anchor the original array to prevent GC collection */
+    lua_pushvalue(L, 1); 
+    lua_setiuservalue(L, -2, 1);
+
+    /* 3. Initialize view properties */
+    view->ndims = view_ndims; /* The view might have fewer dimensions than the original */
+    view->data = arr->data; 
+    view->dtype = arr->dtype;
+    view->is_view = 1;
+    view->offset = arr->offset;
+    view->size = 1;
+
+    /* Allocate metadata based on the NEW number of dimensions */
+    view->shape = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
+    view->strides = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
+
+    if (!view->shape || !view->strides) {
+      return luaL_error(L, "numlu: mkl_malloc failed for view metadata");
+    }
+
+    int target_dim = 0;
+    for (int i = 0; i < arr->ndims; i++) {
+      long start, stop, step;
+      slice_type stype = SLICE_INVALID;
+
+      /* Get slice info from string or integer */
+      if (lua_type(L, i + 2) == LUA_TSTRING) {
+	stype = parse_slice_string(lua_tostring(L, i + 2), arr->shape[i], &start, &stop, &step);
+	if (stype == SLICE_INVALID) {
+	  return luaL_error(L, "numlu: slice out of bounds for dimension %d (max %d)", 
+			    i + 1, (int)arr->shape[i]);
+	}
+      }
+      else {
+	start = (long)luaL_checkinteger(L, i + 2);
+        stype = SLICE_SCALAR;
+        stop = start; /* Not used for scalars but good practice */
+        step = 1;
+      }
+
+      /* CONVERT TO 0-BASED FOR INTERNAL C LOGIC */
+      long start_idx = start - 1;
+      
+      if (stype == SLICE_RANGE) {
+	/* RANGE: Dimension persists in the new view */
+	view->offset += (size_t)start_idx * arr->strides[i];
+	view->strides[target_dim] = arr->strides[i] * (size_t)step;
+
+	/* Calculation for 1-based inclusive indices: */
+	long dim_size = (stop - start) / step + 1;
+	view->shape[target_dim] = (size_t)(dim_size < 0 ? 0 : dim_size);
+	view->size *= view->shape[target_dim];
+	target_dim++;
+      } 
+      else if (stype == SLICE_SCALAR) {
+	/* SCALAR: Dimension collapses (NumPy style) */
+	if (start < 1 || start > (long)arr->shape[i]) {
+	  return luaL_error(L, "numlu: index %ld out of bounds for dim %d", start, i + 1);
+	}
+	view->offset += (size_t)start_idx * arr->strides[i];
+      } 
+      else {
+	return luaL_error(L, "numlu: invalid index/slice at argument %d", i + 2);
+      }
+    }
+    return 1;
+  }
+
   /* 1. Calculate flat index using strides (up to ndims) */
-  size_t flat_idx = 0;
+  size_t flat_idx = (size_t)arr->offset;
   for (int i = 0; i < arr->ndims; i++) {
     lua_Integer idx = luaL_checkinteger(L, i + 2);
     

@@ -17,7 +17,7 @@ const numlu_dtype_info* numlu_dtype_from_string(const char* name) {
 const numlu_dtype_info* numlu_dtype_check(lua_State* L, int arg) {
   if (lua_isstring(L, arg)) {
     const numlu_dtype_info* info = numlu_dtype_from_string(lua_tostring(L, arg));
-    if (!info) luaL_error(L, "numlu: unbekannter dtype '%s'", lua_tostring(L, arg));
+    if (!info) luaL_error(L, "numlu: unknown dtype '%s'", lua_tostring(L, arg));
     return info;
   }
   const numlu_dtype_info** udata = luaL_checkudata(L, arg, "numlu.dtype");
