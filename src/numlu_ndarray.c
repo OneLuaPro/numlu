@@ -709,6 +709,32 @@ static int l_ndarray_at_squeeze(lua_State* L) {
   return 1;
 }
 
+/* Method: __tostring - Provides a readable description of the ndarray */
+static int l_ndarray_tostring(lua_State* L) {
+  numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
+  
+  /* Start building the string: numlu.ndarray<type>({shape}) */
+  luaL_Buffer b;
+  luaL_buffinit(L, &b);
+  
+  luaL_addstring(&b, "numlu.ndarray<");
+  luaL_addstring(&b, arr->dtype->name);
+  luaL_addstring(&b, ">({");
+  
+  for (int i = 0; i < arr->ndims; i++) {
+    char dim[32];
+    sprintf_s(dim, sizeof(dim), "%zu", arr->shape[i]);
+    luaL_addstring(&b, dim);
+    if (i < arr->ndims - 1) {
+      luaL_addstring(&b, ", ");
+    }
+  }
+  
+  luaL_addstring(&b, "})");
+  luaL_pushresult(&b);
+  return 1;
+}
+
 void numlu_ndarray_register(lua_State* L) {
   luaL_newmetatable(L, "numlu.ndarray");
   
@@ -737,6 +763,10 @@ void numlu_ndarray_register(lua_State* L) {
   /* Register squeeze method */
   lua_pushcfunction(L, l_ndarray_at_squeeze);
   lua_setfield(L, -2, "squeeze");
+
+  /* Register the tostring operator */
+  lua_pushcfunction(L, l_ndarray_tostring);
+  lua_setfield(L, -2, "__tostring");
   
   lua_pop(L, 1);
 }
