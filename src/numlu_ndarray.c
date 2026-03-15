@@ -21,10 +21,7 @@ static int l_ndarray_gc(lua_State* L) {
     arr->data = NULL;
   }
   
-  /* 
-   * 2. Always free metadata arrays (shape and strides).
-   * Note: Use free() if they were allocated with malloc() in l_ndarray_call.
-   */
+  /* 2. Always free metadata arrays (shape and strides). */
   if (arr->shape) {
     mkl_free(arr->shape); 
     arr->shape = NULL;
@@ -257,13 +254,18 @@ static slice_type parse_slice_string(const char *s, long max_len, long *start, l
   int count = sscanf_s(s, "%ld:%ld:%ld", start, stop, step);
   if (count < 1) return SLICE_INVALID;
 
-  /* 
-   * FIXME: Reverse slicing (negative steps) is not yet supported.
-   * This requires negative strides and adjusted offset logic.
-   */
-  if (count >= 3 && *step < 1) {
-    /* For now, we force step to 1 or could return SLICE_INVALID */
-    *step = 1; 
+  /* Prevent Division by Zero */
+  if (count >= 3 && *step == 0) {
+    // We use SLICE_INVALID here, the caller l_ndarray_call will throw the luaL_error
+    return SLICE_INVALID;
+  }
+
+  /* FIXME: Reverse slicing (negative steps) is not yet supported.
+   * This requires negative strides and adjusted offset logic. */
+  if (count >= 3 && *step < 0) {
+    // Return a special marker or handle via error in the caller.
+    // For now, let's keep it simple:
+    return SLICE_INVALID;
   }
 
   /* Handle negative indices for 'start' (Lua-stack style: -1 is last) */
@@ -534,17 +536,23 @@ static int l_ndarray_call(lua_State* L) {
     else {
       double complex val;
       if (lua_isnumber(L, val_idx)) {
-        val = lua_tonumber(L, val_idx) + 0.0 * I;
+	/* Clean conversion from real to complex */
+        val = (double)lua_tonumber(L, val_idx) + 0.0 * I;
       }
       else {
         double complex* z = luaL_checkudata(L, val_idx, LCOMPLEX_METATABLE);
         val = *z;
       }
 
-      if (arr->dtype->id == NUMLU_TYPE_C64)
-        ((float complex*)arr->data)[flat_idx] = (float)creal(val) + (float)cimag(val) * I;
-      else
+      if (arr->dtype->id == NUMLU_TYPE_C64) {
+	/* Explicitly cast to float complex for MKL C64 compatibility */
+	float complex fz = (float)creal(val) + (float)cimag(val) * I;
+        ((float complex*)arr->data)[flat_idx] = fz;
+      }
+      else {
+	/* C128 (double complex) matches Lua/lcomplex directly */
         ((double complex*)arr->data)[flat_idx] = val;
+      }
     }
     return 0;
   }
