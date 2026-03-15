@@ -11,6 +11,35 @@ static int parse_slice_string(const char *s, long max_len, long *start, long *st
 /* Metatable name used by the lcomplex library */
 #define LCOMPLEX_METATABLE "complex number"
 
+/* 
+ * Helper: Converts a logical flat index (0-based) to the actual 
+ * memory offset, taking strides and view-offsets into account.
+ */
+static size_t get_flat_offset(numlu_ndarray* arr, size_t logical_idx) {
+  if (arr->ndims <= 1) {
+    /* Optimization for 1D: Simple linear calculation */
+    return arr->offset + (logical_idx * arr->strides[0]);
+  }
+
+  /* For N-D: Decompose logical_idx into coordinates based on shape */
+  size_t offset = arr->offset;
+  size_t remaining = logical_idx;
+  for (int i = 0; i < arr->ndims; i++) {
+    /* 
+     * We need the logical strides (product of shapes) to decompose.
+     * Note: These are NOT the memory strides (arr->strides).
+     */
+    size_t logical_stride = 1;
+    for (int j = i + 1; j < arr->ndims; j++) {
+      logical_stride *= arr->shape[j];
+    }
+    size_t coord = remaining / logical_stride;
+    remaining %= logical_stride;        
+    offset += coord * arr->strides[i];
+  }
+  return offset;
+}
+
 /* Garbage collector: frees MKL-allocated memory and metadata */
 static int l_ndarray_gc(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
@@ -46,7 +75,7 @@ static int l_ndarray_index(lua_State* L) {
     if (idx < 1 || idx > (lua_Integer)arr->size) {
       return luaL_error(L, "numlu: index %d out of bounds (size %d)", (int)idx, (int)arr->size);
     }
-    size_t i = (size_t)idx - 1;
+    size_t i = get_flat_offset(arr, (size_t)idx - 1);
 
     switch (arr->dtype->id) {
     case NUMLU_TYPE_F32:
@@ -116,7 +145,7 @@ static int l_ndarray_newindex(lua_State* L) {
     if (idx < 1 || idx > (lua_Integer)arr->size) {
       return luaL_error(L, "numlu: index %d out of bounds", (int)idx);
     }
-    size_t i = (size_t)idx - 1;
+    size_t i = get_flat_offset(arr, (size_t)idx - 1);
 
     if (arr->dtype->id == NUMLU_TYPE_F32 || arr->dtype->id == NUMLU_TYPE_F64) {
       double val = luaL_checknumber(L, 3);
@@ -156,7 +185,7 @@ static int l_ndarray_at(lua_State* L) {
   if (idx < 1 || idx > (lua_Integer)arr->size) {
     return luaL_error(L, "numlu: index %d out of bounds (size %d)", (int)idx, (int)arr->size);
   }
-  size_t i = (size_t)idx - 1;
+  size_t i = get_flat_offset(arr, (size_t)idx - 1);
   int n_args = lua_gettop(L);
 
   /* GETTER MODE: arr:at(index) */
