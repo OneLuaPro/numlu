@@ -71,10 +71,10 @@ end
 stress_gc()
 
 -- TEST 7: Bounds Checking on Views
-local ok, err = pcall(function() sub(3, 1) end) -- sub is 2x2
+local ok = pcall(function() sub(3, 1) end) -- sub is 2x2
 assert_eq(ok, false, "Accessing sub(3,1) should fail (out of bounds)")
 
-local ok2, err2 = pcall(function() M("1:10", ":") end)
+local ok2 = pcall(function() M("1:10", ":") end)
 assert_eq(ok2, false, "Creating slice 1:10 on 4x4 matrix should fail")
 
 -- TEST 8: Full Slice with ":"
@@ -92,7 +92,7 @@ assert_eq(M(1, 2), 88.0, "Writing to view affects M(1,2)")
 -- TEST 10: Partial Indexing (Implied ":" for missing dimensions)
 print("--- Testing Partial Indexing ---")
 -- M(2) should be equivalent to M(2, ":")
-local partial = M(2) 
+local partial = M(2)
 assert_eq(partial.ndims, 1, "Partial indexing collapses indexed dim")
 assert_eq(partial.size, 4, "Partial indexing keeps full remaining dim")
 assert_eq(partial(1), 5, "M(2)(1) is M(2,1) = 5")
@@ -105,7 +105,7 @@ T(1, 1, 1, 100.0)
 T(2, 1, 1, 200.0)
 
 -- Partial indexing on 3D -> 2D view
-local layer1 = T(1) 
+local layer1 = T(1)
 assert_eq(layer1.ndims, 2, "T(1) results in 2D view")
 assert_eq(layer1(1, 1), 100.0, "Value in layer1(1,1) is T(1,1,1)")
 
@@ -117,7 +117,7 @@ assert_eq(sub_3d(1, 1), 200.0, "Value in sub_3d(1,1) is T(2,1,1)")
 
 -- TEST 12: Setter Guard (Should fail with partial indices)
 print("--- Testing Setter Guards ---")
-local ok_set, err_set = pcall(function() T(1, 1, 999.0) end)
+local ok_set = pcall(function() T(1, 1, 999.0) end)
 assert_eq(ok_set, false, "Setter with missing indices must fail (expected 3, got 2)")
 
 print("\n--- ALL SLICING TESTS PASSED ---")
