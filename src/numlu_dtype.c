@@ -25,9 +25,24 @@ const numlu_dtype_info* numlu_dtype_check(lua_State* L, int arg) {
 }
 
 void numlu_push_dtype(lua_State* L, const numlu_dtype_info* info) {
+  /* 1. Check registry */
+  lua_pushstring(L, info->name);
+  if (lua_rawget(L, LUA_REGISTRYINDEX) == LUA_TUSERDATA) {
+    return; /* Success: Singleton found and pushed */
+  }
+
+  /* 2. Not found: Clean nil and create it */
+  lua_pop(L, 1); /* Remove nil */
   const numlu_dtype_info** udata = lua_newuserdata(L, sizeof(numlu_dtype_info*));
   *udata = info;
   luaL_setmetatable(L, "numlu.dtype");
+    
+  /* 3. Store a copy in registry */
+  lua_pushstring(L, info->name);
+  lua_pushvalue(L, -2);
+  lua_rawset(L, LUA_REGISTRYINDEX);
+
+  /* Final result: One userdata remains on stack */
 }
 
 static int l_dtype_tostring(lua_State* L) {

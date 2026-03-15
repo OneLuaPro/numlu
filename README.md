@@ -31,6 +31,8 @@ The goal of `numlu` is to provide a NumPy-like experience within the Lua ecosyst
 | **Partial Indexing** | `a[1]` | `a(1)` |
 | **Length Operator** | `len(a)` | `#a` |
 | **Flat Setter** | `a[i] = 1.0` | `a[i] = 1.0` |
+| **Squeeze (all)** | `a.squeeze()` | `a:squeeze()` |
+| **Squeeze (axis)** | `a.squeeze(axis=0)` | `a:squeeze(1)` |
 
 > [!NOTE]
 > While NumPy uses square brackets `[]` for multi-dimensional access, Lua's syntax limits `[]` to a single argument. To ensure maximum performance and flexible slicing without creating temporary objects, `numlu` uses the function call syntax `()` for multi-index and slicing operations.
@@ -59,6 +61,15 @@ print(first_row.ndims) -- 1 (Dimension collapsed)
 mat(4, 4, 99.0)
 print(mat("-1", "-1")) -- 99.0
 
+-- Create a 1x3x1 tensor
+local T = numlu.zeros({1, 3, 1}, "float64")
+T(1, 2, 1, 42.0)
+
+-- Squeeze all dimensions of size 1
+local s = T:squeeze()
+print(s.ndims) -- 1 (The 3 is the only remaining dimension)
+print(s(2))    -- 42.0
+
 ```
 
 ## Current Status
@@ -69,3 +80,4 @@ print(mat("-1", "-1")) -- 99.0
 - Multi-Dimensional Getter abd Setter via __call
 - Vectorized Math Operations (MKL VML)
 - Slicing and Views
+- Shape Manipulation: Support for squeeze() and squeeze(axis) to manage dimensions

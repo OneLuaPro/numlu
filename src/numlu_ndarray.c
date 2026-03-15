@@ -340,12 +340,16 @@ int l_ndarray_new(lua_State* L) {
 
   /* 2. Get DType and create Userdata (Lua 5.5: 1 User Value slot) */
   const numlu_dtype_info* dtype = numlu_dtype_check(L, 2);
+  numlu_push_dtype(L, dtype);
   numlu_ndarray* arr = lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
   luaL_setmetatable(L, "numlu.ndarray");
 
-  /* Anchor DType to the ndarray */
-  lua_pushvalue(L, 2);
-  lua_setiuservalue(L, -2, 1);
+  lua_pushvalue(L, -2);        /* Copy the singleton (which is now at -2) */
+  lua_setiuservalue(L, -2, 1); /* Anchor it to the ndarray */
+  lua_remove(L, -2);           /* Remove the extra singleton copy, leave ndarray */
+
+  /* Remove the extra Singleton from stack, leaving only the ndarray */
+  lua_remove(L, -2);
 
   /* 3. Allocate and zero-initialize MKL memory */
   arr->data = mkl_malloc(total_size * dtype->itemsize, 64);
@@ -587,6 +591,77 @@ static int l_ndarray_call(lua_State* L) {
   return 0;
 }
 
+/* Method: arr:squeeze([axis]) - Removes dimensions of size 1 */
+static int l_ndarray_at_squeeze(lua_State* L) {
+  numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
+  int axis = (int)luaL_optinteger(L, 2, 0); /* 0 means: squeeze all */
+
+  /* 1. Validate axis if provided (1-based for Lua) */
+  if (axis != 0 && (axis < 1 || axis > arr->ndims)) {
+    return luaL_error(L, "numlu: axis %d out of bounds (ndims: %d)", axis, arr->ndims);
+  }
+
+  /* 2. Count resulting dimensions */
+  int new_ndims = 0;
+  if (axis == 0) {
+    for (int i = 0; i < arr->ndims; i++) {
+      if (arr->shape[i] > 1) new_ndims++;
+    }
+  }
+  else {
+    if (arr->shape[axis - 1] != 1) {
+      return luaL_error(L, "numlu: cannot squeeze axis %d, size is %d (expected 1)", 
+			axis, (int)arr->shape[axis - 1]);
+    }
+    new_ndims = arr->ndims - 1;
+  }
+
+  /* Handle the edge case: if all dims are 1, we collapse to 1D size 1 (instead of 0D) */
+  if (new_ndims == 0) new_ndims = 1;
+
+  /* 3. Create the new view object */
+  numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
+  luaL_getmetatable(L, "numlu.ndarray");
+  lua_setmetatable(L, -2);
+    
+  lua_pushvalue(L, 1); /* Anchor original */
+  lua_setiuservalue(L, -2, 1);
+
+  view->ndims = new_ndims;
+  view->data = arr->data;
+  view->dtype = arr->dtype;
+  view->is_view = 1;
+  view->offset = arr->offset;
+  view->size = arr->size;
+
+  view->shape = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
+  view->strides = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
+
+  /* 4. Populate new shape and strides */
+  int target = 0;
+  for (int i = 0; i < arr->ndims; i++) {
+    bool skip = false;
+    if (axis == 0) {
+      if (arr->shape[i] == 1 && target < new_ndims) skip = true;
+    }
+    else {
+      if (i == axis - 1) skip = true;
+    }
+    if (!skip && target < new_ndims) {
+      view->shape[target] = arr->shape[i];
+      view->strides[target] = arr->strides[i];
+      target++;
+    }
+  }
+    
+  /* Fallback for the 1x1... case -> 1D view */
+  if (target == 0) {
+    view->shape[0] = 1;
+    view->strides[0] = 1;
+  }
+  return 1;
+}
+
 void numlu_ndarray_register(lua_State* L) {
   luaL_newmetatable(L, "numlu.ndarray");
   
@@ -611,6 +686,10 @@ void numlu_ndarray_register(lua_State* L) {
   /* Register multi-dimensional indexer */
   lua_pushcfunction(L, l_ndarray_call);
   lua_setfield(L, -2, "__call");
+
+  /* Register squeeze method */
+  lua_pushcfunction(L, l_ndarray_at_squeeze);
+  lua_setfield(L, -2, "squeeze");
   
   lua_pop(L, 1);
 }
