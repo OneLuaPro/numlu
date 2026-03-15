@@ -11,6 +11,21 @@ static int parse_slice_string(const char *s, long max_len, long *start, long *st
 /* Metatable name used by the lcomplex library */
 #define LCOMPLEX_METATABLE "complex number"
 
+/*
+ * Helper: Calculates C-contiguous (Row-Major) strides for a given shape.
+ * Strides are calculated from the last dimension to the first.
+ */
+static void calc_strides_row_major(int ndims, const size_t* shape, size_t* strides) {
+  if (ndims == 0) return;
+
+  size_t current_stride = 1;
+  /* Calculate from last dimension to first (Right-to-Left) */
+  for (int i = ndims - 1; i >= 0; i--) {
+    strides[i] = current_stride;
+    current_stride *= shape[i];
+  }
+}
+
 /* 
  * Helper: Checks if the array is C-contiguous (Row-Major).
  * Returns 1 if contiguous, 0 otherwise.
@@ -393,11 +408,7 @@ int l_ndarray_new(lua_State* L) {
     }
     
     /* Calculate Strides (Row-Major / C-Style) */
-    size_t current_stride = 1;
-    for (int i = arr->ndims - 1; i >= 0; i--) {
-      arr->strides[i] = current_stride;
-      current_stride *= arr->shape[i];
-    }
+    calc_strides_row_major(arr->ndims, arr->shape, arr->strides);
   } 
   else {
     return luaL_typeerror(L, 1, "number or table");
@@ -757,6 +768,113 @@ static int l_ndarray_tostring(lua_State* L) {
   return 1;
 }
 
+/*
+ * Method: arr:reshape({shape} | size)
+ * Creates a new view with a modified shape.
+ * Supports NumPy-style -1 for one dimension to be auto-calculated.
+ * Only works on contiguous arrays to avoid data corruption.
+ */
+static int l_ndarray_reshape(lua_State* L) {
+  numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
+
+  /* 1. Safety Check: Reshaping without copy requires contiguous memory layout */
+  if (!numlu_is_contiguous(arr)) {
+    return luaL_error(L, "numlu: reshape without copy only possible for contiguous arrays");
+  }
+
+  int new_ndims = 0;
+  size_t* new_shape = NULL;
+  int auto_dim_idx = -1;
+  size_t product_other_dims = 1;
+
+  /* 2. Parse New Shape: Support for scalar (1D) or table (N-D) */
+  if (lua_isnumber(L, 2)) {
+    new_ndims = 1;
+    long dim = (long)luaL_checkinteger(L, 2);
+    new_shape = (size_t*)mkl_malloc(sizeof(size_t), 64);
+        
+    if (dim == -1) {
+      new_shape[0] = arr->size;
+    }
+    else {
+      if (dim <= 0) {
+	mkl_free(new_shape); return luaL_error(L, "numlu: size must be positive or -1");
+      }
+      new_shape[0] = (size_t)dim;
+    }
+    product_other_dims = new_shape[0];
+  } 
+  else if (lua_istable(L, 2)) {
+    new_ndims = (int)lua_rawlen(L, 2);
+    if (new_ndims == 0) return luaL_error(L, "numlu: shape table cannot be empty");
+
+    new_shape = (size_t*)mkl_malloc(new_ndims * sizeof(size_t), 64);
+    for (int i = 1; i <= new_ndims; i++) {
+      lua_rawgeti(L, 2, i);
+      long dim = (long)luaL_checkinteger(L, -1);
+      if (dim == -1) {
+	if (auto_dim_idx != -1) {
+	  mkl_free(new_shape); return luaL_error(L, "numlu: only one -1 allowed");
+	}
+	auto_dim_idx = i - 1;
+      }
+      else {
+	if (dim <= 0) {
+	  mkl_free(new_shape); return luaL_error(L, "numlu: dimensions must be positive");
+	}
+	new_shape[i-1] = (size_t)dim;
+	product_other_dims *= new_shape[i-1];
+      }
+      lua_pop(L, 1);
+    }
+
+    /* 3. Handle Auto-Dimension (-1) logic */
+    if (auto_dim_idx != -1) {
+      if (arr->size % product_other_dims != 0) {
+	mkl_free(new_shape);
+	return luaL_error(L, "numlu: total size %zu not divisible by product %zu",
+			  arr->size, product_other_dims);
+      }
+      new_shape[auto_dim_idx] = arr->size / product_other_dims;
+      product_other_dims *= new_shape[auto_dim_idx];
+    }
+  } 
+  else {
+    return luaL_typeerror(L, 2, "number or table");
+  }
+
+  /* 4. Validate Final Size */
+  if (product_other_dims != arr->size) {
+    mkl_free(new_shape);
+    return luaL_error(L, "numlu: reshape total size mismatch (expected %zu, got %zu)",
+		      arr->size, product_other_dims);
+  }
+
+  /* 5. Create new View Userdata (similar to squeeze/slicing) */
+  numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
+  luaL_getmetatable(L, "numlu.ndarray");
+  lua_setmetatable(L, -2);
+
+  /* Anchor original root to prevent GC of underlying data */
+  if (arr->is_view) lua_getiuservalue(L, 1, 1);
+  else lua_pushvalue(L, 1);
+  lua_setiuservalue(L, -2, 1);
+
+  /* Populate Metadata */
+  view->ndims = new_ndims;
+  view->shape = new_shape;
+  view->strides = (size_t*)mkl_malloc(new_ndims * sizeof(size_t), 64);
+  calc_strides_row_major(view->ndims, view->shape, view->strides);
+
+  view->data = arr->data;
+  view->dtype = arr->dtype;
+  view->size = arr->size;
+  view->is_view = 1;
+  view->offset = arr->offset;
+
+  return 1;
+}
+
 void numlu_ndarray_register(lua_State* L) {
   luaL_newmetatable(L, "numlu.ndarray");
   
@@ -789,6 +907,10 @@ void numlu_ndarray_register(lua_State* L) {
   /* Register the tostring operator */
   lua_pushcfunction(L, l_ndarray_tostring);
   lua_setfield(L, -2, "__tostring");
+
+  /* Register reshape method */
+  lua_pushcfunction(L, l_ndarray_reshape);
+  lua_setfield(L, -2, "reshape");
   
   lua_pop(L, 1);
 }
