@@ -11,6 +11,25 @@ static int parse_slice_string(const char *s, long max_len, long *start, long *st
 /* Metatable name used by the lcomplex library */
 #define LCOMPLEX_METATABLE "complex number"
 
+/* 
+ * Helper: Allocates a GC-managed memory block for metadata (shape or strides).
+ * It creates a new userdata, anchors it to a specific User Value slot of the 
+ * ndarray (at stack index -2), and returns the raw pointer.
+ */
+static void* alloc_metadata_buffer(lua_State* L, int ndims, int uv_slot) {
+  size_t size = ndims * sizeof(size_t);
+  
+  /* 1. Create a new "raw" userdata block for the metadata.
+   * This is pushed onto the stack (at index -1). */
+  void* ptr = lua_newuserdatauv(L, size, 0); 
+  
+  /* 2. Anchor this buffer to the ndarray (currently at index -2).
+   * lua_setiuservalue pops the buffer from the stack and stores it in the slot. */
+  lua_setiuservalue(L, -2, uv_slot); 
+  
+  return ptr;
+}
+
 /*
  * Helper: Calculates C-contiguous (Row-Major) strides for a given shape.
  * Strides are calculated from the last dimension to the first.
@@ -73,25 +92,18 @@ static size_t get_flat_offset(numlu_ndarray* arr, size_t logical_idx) {
   return offset;
 }
 
-/* Garbage collector: frees MKL-allocated memory and metadata */
+/* Garbage collector: frees ONLY MKL-allocated data block if owner */
 static int l_ndarray_gc(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
   
-  /* 1. Free main data only if we are the owner (is_view == 0) */
+  /* 1. Free main data block only if this object is the owner (is_view == 0) */
   if (!arr->is_view && arr->data) {
     mkl_free(arr->data);
     arr->data = NULL;
   }
   
-  /* 2. Always free metadata arrays (shape and strides). */
-  if (arr->shape) {
-    mkl_free(arr->shape); 
-    arr->shape = NULL;
-  }
-  if (arr->strides) {
-    mkl_free(arr->strides);
-    arr->strides = NULL;
-  }
+  /* 2. IMPORTANT: Do NOT free arr->shape or arr->strides. 
+   * They are now managed by Lua's GC as User Values in slots 2 and 3. */
   
   return 0;
 }
@@ -360,72 +372,66 @@ static slice_type parse_slice_string(const char *s, long max_len, long *start, l
 
 /* Constructor: numlu.zeros(size|{shape}, dtype) */
 int l_ndarray_new(lua_State* L) {
-  /* 1. Preliminary DType check (before we do anything else) */
   const numlu_dtype_info* dtype = numlu_dtype_check(L, 2);
   
-  /* 2. Create Userdata EARLY for GC safety */
-  /* We use 1 User Value slot for the DType Singleton */
-  numlu_ndarray* arr = (numlu_ndarray*)lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
-  memset(arr, 0, sizeof(numlu_ndarray)); /* CRITICAL: Ensure all pointers are NULL for GC */
+  numlu_ndarray* arr = (numlu_ndarray*)lua_newuserdatauv(L, sizeof(numlu_ndarray), 3);
+  memset(arr, 0, sizeof(numlu_ndarray));
   luaL_setmetatable(L, "numlu.ndarray");
 
-  /* 3. Anchor DType singleton to the ndarray immediately */
-  numlu_push_dtype(L, dtype); /* Singleton is now at -1, ndarray at -2 */
-  lua_setiuservalue(L, -2, 1); /* Anchor it, stack is now [ndarray] */
+  /* Slot 1: Anchor DType singleton */
+  numlu_push_dtype(L, dtype);
+  lua_setiuservalue(L, -2, 1);
 
-  /* 4. Parse Shape and allocate Metadata (writing directly into 'arr') */
   size_t total_size = 1;
 
+  /* First: Determine ndims to allocate GC-safe metadata buffers */
   if (lua_isnumber(L, 1)) {
     arr->ndims = 1;
-    lua_Integer s = luaL_checkinteger(L, 1);
-    if (s <= 0) return luaL_error(L, "numlu: size must be positive");
-    
-    arr->shape = (size_t*)mkl_malloc(sizeof(size_t), 64);
-    arr->strides = (size_t*)mkl_malloc(sizeof(size_t), 64);
-    
-    if (!arr->shape || !arr->strides) return luaL_error(L, "numlu: mkl_malloc failed for metadata");
-
-    arr->shape[0] = (size_t)s;
-    arr->strides[0] = 1;
-    total_size = arr->shape[0];
   } 
   else if (lua_istable(L, 1)) {
     arr->ndims = (int)lua_rawlen(L, 1);
     if (arr->ndims == 0) return luaL_error(L, "numlu: shape table cannot be empty");
+  } 
+  else {
+    return luaL_typeerror(L, 1, "number or table");
+  }
+
+  /* Allocate metadata buffers IMMEDIATELY after ndims is known.
+     The ndarray is currently at index -1 on the stack. */
+  arr->shape = (size_t*)alloc_metadata_buffer(L, arr->ndims, 2);   /* Slot 2 */
+  arr->strides = (size_t*)alloc_metadata_buffer(L, arr->ndims, 3); /* Slot 3 */
+
+  /* Now fill the buffers based on input */
+  if (lua_isnumber(L, 1)) {
+    lua_Integer s = luaL_checkinteger(L, 1);
+    if (s <= 0) return luaL_error(L, "numlu: size must be positive");
     
-    arr->shape = (size_t*)mkl_malloc(arr->ndims * sizeof(size_t), 64);
-    arr->strides = (size_t*)mkl_malloc(arr->ndims * sizeof(size_t), 64);
-    
-    if (!arr->shape || !arr->strides) return luaL_error(L, "numlu: mkl_malloc failed for metadata");
-    
-    /* Read dimensions and calculate total flat size */
+    arr->shape[0] = (size_t)s;
+    arr->strides[0] = 1;
+    total_size = arr->shape[0];
+  } 
+  else {
     for (int i = 1; i <= arr->ndims; i++) {
       lua_rawgeti(L, 1, i);
       arr->shape[i-1] = (size_t)luaL_checkinteger(L, -1);
       total_size *= arr->shape[i-1];
       lua_pop(L, 1);
     }
-    
-    /* Calculate Strides (Row-Major / C-Style) */
     calc_strides_row_major(arr->ndims, arr->shape, arr->strides);
-  } 
-  else {
-    return luaL_typeerror(L, 1, "number or table");
   }
 
-  /* 5. Allocate and zero-initialize MKL memory */
+  /* Allocate and zero-initialize MKL memory */
   arr->size = total_size;
   arr->dtype = dtype;
   arr->data = mkl_malloc(total_size * dtype->itemsize, 64);
   
   if (!arr->data) {
-    /* No need to mkl_free(shape) here! luaL_error triggers GC, which calls l_ndarray_gc */
+    /* No manual free needed: Lua GC handles shape/strides on error */
     return luaL_error(L, "numlu: mkl_malloc failed for data");
   }
   
   memset(arr->data, 0, total_size * dtype->itemsize);
-  arr->is_view = 0; /* Owner of the memory */
+  arr->is_view = 0;
   arr->offset = 0;
   
   return 1;
@@ -493,7 +499,7 @@ static int l_ndarray_call(lua_State* L) {
             view_ndims++;
           }
         }
-        /* Scalar integers collapse the dimension */
+        /* Scalar integers collapse the dimension, so view_ndims does not increase */
       }
       else {
         /* Missing indices in partial indexing are treated as ":" (Full Range) */
@@ -501,22 +507,27 @@ static int l_ndarray_call(lua_State* L) {
       }
     }
 
-    /* Step 2: Initialize the new View object */
-    numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
+    /* Step 2: Initialize the new View object with 3 User Value slots */
+    numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 3);
+    memset(view, 0, sizeof(numlu_ndarray)); /* Safety: ensure all pointers are NULL */
     luaL_getmetatable(L, "numlu.ndarray");
     lua_setmetatable(L, -2);
 
-    /* Anchor original array in uservalue to prevent GC collection while view exists */
-    /* Optimize View-Chain: Anchor the original root owner if current is already a view */
+    /* Slot 1: Anchor original array/owner to prevent GC while view exists */
     if (arr->is_view) {
-      /* Get the root owner from current view */
-      lua_getiuservalue(L, 1, 1);
+      lua_getiuservalue(L, 1, 1); /* Get the root owner from current view */
     }
     else {
-      /* Current is the owner */
-      lua_pushvalue(L, 1);
+      lua_pushvalue(L, 1); /* Current is the owner */
     }
     lua_setiuservalue(L, -2, 1);
+
+    /* Slot 2 & 3: Allocate GC-managed metadata for the view */
+    /* Note: We handle the 0-dim case (scalar view) by allocating at least 1 element */
+    /* or handling it specifically */
+    int alloc_dims = (view_ndims > 0) ? view_ndims : 1;
+    view->shape = (size_t*)alloc_metadata_buffer(L, alloc_dims, 2);
+    view->strides = (size_t*)alloc_metadata_buffer(L, alloc_dims, 3);
 
     view->ndims = view_ndims;
     view->data = arr->data; 
@@ -525,14 +536,6 @@ static int l_ndarray_call(lua_State* L) {
     view->offset = arr->offset;
     view->size = 1;
     
-    /* Allocate metadata for the view */
-    view->shape = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
-    view->strides = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
-
-    if (!view->shape || !view->strides) {
-      return luaL_error(L, "numlu: mkl_malloc failed for view metadata");
-    }
-
     /* Step 3: Populate view metadata and calculate offset */
     int target_dim = 0;
     for (int i = 0; i < (int)arr->ndims; i++) {
@@ -543,11 +546,12 @@ static int l_ndarray_call(lua_State* L) {
         if (lua_type(L, i + 2) == LUA_TSTRING) {
           stype = parse_slice_string(lua_tostring(L, i + 2), arr->shape[i], &start, &stop, &step);
           if (stype == SLICE_INVALID) {
+            /* No manual free needed: Lua GC handles the already allocated view and its buffers */
             return luaL_error(L, "numlu: slice out of bounds for dimension %d (max %d)", 
                               i + 1, (int)arr->shape[i]);
           }
         }
-	else {
+        else {
           start = (long)luaL_checkinteger(L, i + 2);
           stype = SLICE_SCALAR;
           stop = start;
@@ -582,9 +586,8 @@ static int l_ndarray_call(lua_State* L) {
     }
     return 1;
   }
-
+ 
   /* --- Scalar Access Mode (Standard Getter/Setter) --- */
-
   /* Calculate flat index using strides */
   size_t flat_idx = (size_t)arr->offset;
   for (int i = 0; i < (int)arr->ndims; i++) {
@@ -681,41 +684,35 @@ static int l_ndarray_at_squeeze(lua_State* L) {
   else {
     if (arr->shape[axis - 1] != 1) {
       return luaL_error(L, "numlu: cannot squeeze axis %d, size is %d (expected 1)", 
-			axis, (int)arr->shape[axis - 1]);
+                        axis, (int)arr->shape[axis - 1]);
     }
     new_ndims = arr->ndims - 1;
   }
 
-  /* Handle the edge case: if all dims are 1, we collapse to 1D size 1 (instead of 0D) */
   if (new_ndims == 0) new_ndims = 1;
 
-  /* 3. Create the new view object */
-  numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
+  /* 3. Create the new view object with 3 User Value slots */
+  numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 3);
+  memset(view, 0, sizeof(numlu_ndarray));
   luaL_getmetatable(L, "numlu.ndarray");
   lua_setmetatable(L, -2);
     
-  /* Anchor original array in uservalue to prevent GC collection while view exists */
-  /* Optimize View-Chain: Anchor the original root owner if current is already a view */
-  if (arr->is_view) {
-    /* Get the root owner from current view */
-    lua_getiuservalue(L, 1, 1);
-  }
-  else {
-    /* Current is the owner */
-    lua_pushvalue(L, 1);
-  }
+  /* Slot 1: Anchor original owner */
+  if (arr->is_view) lua_getiuservalue(L, 1, 1);
+  else lua_pushvalue(L, 1);
   lua_setiuservalue(L, -2, 1);
 
+  /* Slot 2 & 3: Allocate GC-managed metadata buffers */
   view->ndims = new_ndims;
+  view->shape = (size_t*)alloc_metadata_buffer(L, view->ndims, 2);
+  view->strides = (size_t*)alloc_metadata_buffer(L, view->ndims, 3);
+
   view->data = arr->data;
   view->dtype = arr->dtype;
   view->is_view = 1;
   view->offset = arr->offset;
-  view->size = 1; /* Reset size to recalculate from new shape */
+  view->size = 1; 
   
-  view->shape = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
-  view->strides = (size_t*)mkl_malloc(view->ndims * sizeof(size_t), 64);
-
   /* 4. Populate new shape and strides */
   int target = 0;
   for (int i = 0; i < arr->ndims; i++) {
@@ -729,12 +726,11 @@ static int l_ndarray_at_squeeze(lua_State* L) {
     if (!skip && target < new_ndims) {
       view->shape[target] = arr->shape[i];
       view->strides[target] = arr->strides[i];
-      view->size *= view->shape[target]; /* Recalculate size */
+      view->size *= view->shape[target];
       target++;
     }
   }
     
-  /* Fallback for the 1x1... case -> 1D view */
   if (target == 0) {
     view->shape[0] = 1;
     view->strides[0] = 1;
@@ -746,10 +742,8 @@ static int l_ndarray_at_squeeze(lua_State* L) {
 static int l_ndarray_tostring(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
   
-  /* Start building the string: numlu.ndarray<type>({shape}) */
   luaL_Buffer b;
   luaL_buffinit(L, &b);
-  
   luaL_addstring(&b, "numlu.ndarray<");
   luaL_addstring(&b, arr->dtype->name);
   luaL_addstring(&b, ">({");
@@ -758,9 +752,7 @@ static int l_ndarray_tostring(lua_State* L) {
     char dim[32];
     sprintf_s(dim, sizeof(dim), "%zu", arr->shape[i]);
     luaL_addstring(&b, dim);
-    if (i < arr->ndims - 1) {
-      luaL_addstring(&b, ", ");
-    }
+    if (i < arr->ndims - 1) luaL_addstring(&b, ", ");
   }
   
   luaL_addstring(&b, "})");
@@ -768,104 +760,80 @@ static int l_ndarray_tostring(lua_State* L) {
   return 1;
 }
 
-/*
- * Method: arr:reshape({shape} | size)
- * Creates a new view with a modified shape.
- * Supports NumPy-style -1 for one dimension to be auto-calculated.
- * Only works on contiguous arrays to avoid data corruption.
- */
+/* Method: arr:reshape({shape} | size) */
 static int l_ndarray_reshape(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
 
-  /* 1. Safety Check: Reshaping without copy requires contiguous memory layout */
   if (!numlu_is_contiguous(arr)) {
     return luaL_error(L, "numlu: reshape without copy only possible for contiguous arrays");
   }
-
+  
   int new_ndims = 0;
-  size_t* new_shape = NULL;
-  int auto_dim_idx = -1;
-  size_t product_other_dims = 1;
+  if (lua_isnumber(L, 2)) new_ndims = 1;
+  else if (lua_istable(L, 2)) new_ndims = (int)lua_rawlen(L, 2);
+  else return luaL_typeerror(L, 2, "number or table");
 
-  /* 2. Parse New Shape: Support for scalar (1D) or table (N-D) */
-  if (lua_isnumber(L, 2)) {
-    new_ndims = 1;
-    long dim = (long)luaL_checkinteger(L, 2);
-    new_shape = (size_t*)mkl_malloc(sizeof(size_t), 64);
-        
-    if (dim == -1) {
-      new_shape[0] = arr->size;
-    }
-    else {
-      if (dim <= 0) {
-	mkl_free(new_shape); return luaL_error(L, "numlu: size must be positive or -1");
-      }
-      new_shape[0] = (size_t)dim;
-    }
-    product_other_dims = new_shape[0];
-  } 
-  else if (lua_istable(L, 2)) {
-    new_ndims = (int)lua_rawlen(L, 2);
-    if (new_ndims == 0) return luaL_error(L, "numlu: shape table cannot be empty");
-
-    new_shape = (size_t*)mkl_malloc(new_ndims * sizeof(size_t), 64);
-    for (int i = 1; i <= new_ndims; i++) {
-      lua_rawgeti(L, 2, i);
-      long dim = (long)luaL_checkinteger(L, -1);
-      if (dim == -1) {
-	if (auto_dim_idx != -1) {
-	  mkl_free(new_shape); return luaL_error(L, "numlu: only one -1 allowed");
-	}
-	auto_dim_idx = i - 1;
-      }
-      else {
-	if (dim <= 0) {
-	  mkl_free(new_shape); return luaL_error(L, "numlu: dimensions must be positive");
-	}
-	new_shape[i-1] = (size_t)dim;
-	product_other_dims *= new_shape[i-1];
-      }
-      lua_pop(L, 1);
-    }
-
-    /* 3. Handle Auto-Dimension (-1) logic */
-    if (auto_dim_idx != -1) {
-      if (arr->size % product_other_dims != 0) {
-	mkl_free(new_shape);
-	return luaL_error(L, "numlu: total size %zu not divisible by product %zu",
-			  arr->size, product_other_dims);
-      }
-      new_shape[auto_dim_idx] = arr->size / product_other_dims;
-      product_other_dims *= new_shape[auto_dim_idx];
-    }
-  } 
-  else {
-    return luaL_typeerror(L, 2, "number or table");
-  }
-
-  /* 4. Validate Final Size */
-  if (product_other_dims != arr->size) {
-    mkl_free(new_shape);
-    return luaL_error(L, "numlu: reshape total size mismatch (expected %zu, got %zu)",
-		      arr->size, product_other_dims);
-  }
-
-  /* 5. Create new View Userdata (similar to squeeze/slicing) */
-  numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 1);
+  if (new_ndims == 0) return luaL_error(L, "numlu: shape cannot be empty");
+  
+  /* Create the new View Userdata EARLY with 3 slots */
+  numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 3);
+  memset(view, 0, sizeof(numlu_ndarray));
   luaL_getmetatable(L, "numlu.ndarray");
   lua_setmetatable(L, -2);
 
-  /* Anchor original root to prevent GC of underlying data */
+  /* Slot 1: Anchor owner */
   if (arr->is_view) lua_getiuservalue(L, 1, 1);
   else lua_pushvalue(L, 1);
   lua_setiuservalue(L, -2, 1);
 
-  /* Populate Metadata */
+  /* Slot 2 & 3: Allocate GC-managed metadata */
   view->ndims = new_ndims;
-  view->shape = new_shape;
-  view->strides = (size_t*)mkl_malloc(new_ndims * sizeof(size_t), 64);
-  calc_strides_row_major(view->ndims, view->shape, view->strides);
+  view->shape = (size_t*)alloc_metadata_buffer(L, view->ndims, 2);
+  view->strides = (size_t*)alloc_metadata_buffer(L, view->ndims, 3);
+  
+  /* Parse and Validate Shape directly into the view->shape buffer */
+  int auto_dim_idx = -1;
+  size_t product_other_dims = 1;
 
+  if (lua_isnumber(L, 2)) {
+    long dim = (long)luaL_checkinteger(L, 2);
+    if (dim == -1) view->shape[0] = arr->size;
+    else {
+      if (dim <= 0) return luaL_error(L, "numlu: size must be positive");
+      view->shape[0] = (size_t)dim;
+    }
+    product_other_dims = view->shape[0];
+  } 
+  else {
+    for (int i = 1; i <= new_ndims; i++) {
+      lua_rawgeti(L, 2, i);
+      long dim = (long)luaL_checkinteger(L, -1);
+      if (dim == -1) {
+        if (auto_dim_idx != -1) return luaL_error(L, "numlu: only one -1 allowed");
+        auto_dim_idx = i - 1;
+      }
+      else {
+        if (dim <= 0) return luaL_error(L, "numlu: dimensions must be positive");
+        view->shape[i-1] = (size_t)dim;
+        product_other_dims *= view->shape[i-1];
+      }
+      lua_pop(L, 1);
+    }
+    if (auto_dim_idx != -1) {
+      if (arr->size % product_other_dims != 0)
+        return luaL_error(L, "numlu: size %zu not divisible by product %zu",
+			  arr->size, product_other_dims);
+      view->shape[auto_dim_idx] = arr->size / product_other_dims;
+      product_other_dims *= view->shape[auto_dim_idx];
+    }
+  }
+  
+  if (product_other_dims != arr->size) {
+    return luaL_error(L, "numlu: reshape total size mismatch");
+  }
+
+  /* Finalize properties */
+  calc_strides_row_major(view->ndims, view->shape, view->strides);
   view->data = arr->data;
   view->dtype = arr->dtype;
   view->size = arr->size;
