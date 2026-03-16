@@ -65,4 +65,29 @@ assert_eq(val12:imag(), -2.0, "Complex (1,2) imag part")
 assert_eq(val22:real(), 10.5, "Complex (2,2) auto-conversion from real")
 assert_eq(val22:imag(), 0.0, "Complex (2,2) imag part is zero")
 
+print("\n--- Test 7: Scalar (0-D) Arrays ---")
+-- 1. Create a 0-D array (scalar) using an empty table
+local scalar = numlu.zeros({}, "float64")
+assert_eq(scalar.ndims, 0, "Scalar ndims is 0")
+assert_eq(scalar.size, 1, "Scalar size is 1")
+assert_eq(#scalar.shape, 0, "Scalar shape is an empty table")
+assert_eq(#scalar, 0, "Length operator (#scalar) is 0")
+
+-- 2. Access and modify the single value
+-- Use flat indexing [1] or () for the single element
+scalar[1] = 42.5
+assert_eq(scalar[1], 42.5, "Scalar access via flat index [1]")
+
+-- 3. ToString representation
+local s_str = tostring(scalar)
+local expected_str = "numlu.ndarray<float64>({})"
+local match = (s_str == expected_str)
+assert_eq(match, true, "Scalar tostring representation (Actual: " .. s_str .. ")")
+
+-- 4. Complex Scalar
+local c_scalar = numlu.zeros({}, "complex128")
+c_scalar[1] = complex.new(1, 2)
+assert_eq(c_scalar[1]:real(), 1.0, "Complex scalar real part")
+assert_eq(c_scalar[1]:imag(), 2.0, "Complex scalar imag part")
+
 print("\n--- ALL BASE TESTS PASSED ---")

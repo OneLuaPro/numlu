@@ -13,21 +13,25 @@ static int parse_slice_string(const char *s, long max_len, long *start, long *st
 
 /* 
  * Helper: Allocates a GC-managed memory block for metadata (shape or strides).
- * It creates a new userdata, anchors it to a specific User Value slot of the 
- * ndarray (at stack index -2), and returns the raw pointer.
+ * Supports 0-D arrays by ensuring at least 1 byte is allocated for Lua,
+ * while returning NULL to the C-struct to signify a scalar/0-D state.
  */
 static void* alloc_metadata_buffer(lua_State* L, int ndims, int uv_slot) {
-  size_t size = ndims * sizeof(size_t);
+  /* Ensure we always allocate at least a dummy byte to keep Lua's GC happy,
+   * as 0-byte userdata behavior can be implementation-defined. */
+  size_t alloc_size = (ndims > 0) ? (ndims * sizeof(size_t)) : 1;
   
   /* 1. Create a new "raw" userdata block for the metadata.
    * This is pushed onto the stack (at index -1). */
-  void* ptr = lua_newuserdatauv(L, size, 0); 
+  void* ptr = lua_newuserdatauv(L, alloc_size, 0); 
   
   /* 2. Anchor this buffer to the ndarray (currently at index -2).
    * lua_setiuservalue pops the buffer from the stack and stores it in the slot. */
   lua_setiuservalue(L, -2, uv_slot); 
   
-  return ptr;
+  /* For 0-D arrays, we return NULL so the C-code knows there is no 
+   * shape/stride array to iterate over. */
+  return (ndims > 0) ? ptr : NULL;
 }
 
 /*
@@ -68,12 +72,18 @@ static int numlu_is_contiguous(numlu_ndarray* arr) {
  * memory offset, taking strides and view-offsets into account.
  */
 static size_t get_flat_offset(numlu_ndarray* arr, size_t logical_idx) {
-  if (arr->ndims <= 1) {
-    /* Optimization for 1D: Simple linear calculation */
+  /* CASE 0-D: Scalars have only one element. The logical_idx must be 0.
+     We return the base offset without accessing strides/shape. */
+  if (arr->ndims == 0) {
+    return arr->offset;
+  }
+
+  /* CASE 1-D: Simple linear calculation (Optimization) */
+  if (arr->ndims == 1) {
     return arr->offset + (logical_idx * arr->strides[0]);
   }
 
-  /* For N-D: Decompose logical_idx into coordinates based on shape */
+  /* CASE N-D: Decompose logical_idx into coordinates based on shape */
   size_t offset = arr->offset;
   size_t remaining = logical_idx;
   for (int i = 0; i < arr->ndims; i++) {
@@ -120,6 +130,8 @@ static int l_ndarray_index(lua_State* L) {
     if (idx < 1 || idx > (lua_Integer)arr->size) {
       return luaL_error(L, "numlu: index %d out of bounds (size %d)", (int)idx, (int)arr->size);
     }
+
+    /* get_flat_offset is now 0-D aware and returns arr->offset if ndims == 0 */
     size_t i = get_flat_offset(arr, (size_t)idx - 1);
 
     switch (arr->dtype->id) {
@@ -130,28 +142,29 @@ static int l_ndarray_index(lua_State* L) {
       }
     case NUMLU_TYPE_F64:
       {
-        lua_pushnumber(L, ((double*)arr->data)[i]);
-        return 1;
+	lua_pushnumber(L, ((double*)arr->data)[i]);
+	return 1;
       }
     case NUMLU_TYPE_C64:
     case NUMLU_TYPE_C128:
       {
-	double complex* res = lua_newuserdatauv(L, sizeof(double complex), 0);
-	luaL_setmetatable(L, LCOMPLEX_METATABLE);
-	if (arr->dtype->id == NUMLU_TYPE_C64) {
-	  float complex c = ((float complex*)arr->data)[i];
-	  *res = (double)crealf(c) + (double)cimagf(c) * I;
-          }
-	else {
-	  *res = ((double complex*)arr->data)[i];
-	}
-	return 1;
+        double complex* res = lua_newuserdatauv(L, sizeof(double complex), 0);
+        luaL_setmetatable(L, LCOMPLEX_METATABLE);
+        if (arr->dtype->id == NUMLU_TYPE_C64) {
+          float complex c = ((float complex*)arr->data)[i];
+          *res = (double)crealf(c) + (double)cimagf(c) * I;
+        }
+        else {
+          *res = ((double complex*)arr->data)[i];
+        }
+        return 1;
       }
     }
   }
 
   /* CASE B: Property String -> arr.size, arr.shape, etc. */
   const char* key = luaL_checkstring(L, 2);
+  
   if (strcmp(key, "dtype") == 0) {
     lua_getiuservalue(L, 1, 1);
     return 1;
@@ -165,10 +178,13 @@ static int l_ndarray_index(lua_State* L) {
     return 1;
   }
   if (strcmp(key, "shape") == 0) {
+    /* Create a table of size ndims. For 0-D, this creates an empty table {}. */
     lua_createtable(L, arr->ndims, 0);
-    for (int i = 0; i < arr->ndims; i++) {
-      lua_pushinteger(L, (lua_Integer)arr->shape[i]);
-      lua_rawseti(L, -2, i + 1);
+    if (arr->ndims > 0 && arr->shape != NULL) {
+      for (int i = 0; i < arr->ndims; i++) {
+        lua_pushinteger(L, (lua_Integer)arr->shape[i]);
+        lua_rawseti(L, -2, i + 1);
+      }
     }
     return 1;
   }
@@ -305,12 +321,18 @@ static int l_ndarray_at(lua_State* L) {
 static int l_ndarray_len(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
   
-  if (arr->ndims > 0) {
+  /* 
+   * Check if we have at least one dimension and a valid shape pointer.
+   * For 0-D arrays (scalars), shape is NULL and ndims is 0, so we return 0.
+   */
+  if (arr->ndims > 0 && arr->shape != NULL) {
     lua_pushinteger(L, (lua_Integer)arr->shape[0]);
   }
   else {
+    /* Scalars and empty-defined arrays have a length of 0 in the first dim */
     lua_pushinteger(L, 0);
   }
+  
   return 1;
 }
 
@@ -388,24 +410,24 @@ int l_ndarray_new(lua_State* L) {
 
   size_t total_size = 1;
 
-  /* First: Determine ndims to allocate GC-safe metadata buffers */
+  /* 1. Determine ndims (ndims == 0 is now allowed for scalars) */
   if (lua_isnumber(L, 1)) {
     arr->ndims = 1;
   } 
   else if (lua_istable(L, 1)) {
     arr->ndims = (int)lua_rawlen(L, 1);
-    if (arr->ndims == 0) return luaL_error(L, "numlu: shape table cannot be empty");
+    /* No error for empty table; ndims will be 0 */
   } 
   else {
     return luaL_typeerror(L, 1, "number or table");
   }
 
-  /* Allocate metadata buffers IMMEDIATELY after ndims is known.
-     The ndarray is currently at index -1 on the stack. */
+  /* 2. Allocate metadata buffers IMMEDIATELY.
+     alloc_metadata_buffer returns NULL for ndims == 0 */
   arr->shape = (size_t*)alloc_metadata_buffer(L, arr->ndims, 2);   /* Slot 2 */
   arr->strides = (size_t*)alloc_metadata_buffer(L, arr->ndims, 3); /* Slot 3 */
 
-  /* Now fill the buffers based on input */
+  /* 3. Populate buffers and calculate total size */
   if (lua_isnumber(L, 1)) {
     lua_Integer s = luaL_checkinteger(L, 1);
     if (s <= 0) return luaL_error(L, "numlu: size must be positive");
@@ -414,7 +436,8 @@ int l_ndarray_new(lua_State* L) {
     arr->strides[0] = 1;
     total_size = arr->shape[0];
   } 
-  else {
+  else if (arr->ndims > 0) {
+    /* Standard N-D initialization */
     for (int i = 1; i <= arr->ndims; i++) {
       lua_rawgeti(L, 1, i);
       arr->shape[i-1] = (size_t)luaL_checkinteger(L, -1);
@@ -422,15 +445,18 @@ int l_ndarray_new(lua_State* L) {
       lua_pop(L, 1);
     }
     calc_strides_row_major(arr->ndims, arr->shape, arr->strides);
+  } 
+  else {
+    /* 0-D Scalar Case: total_size remains 1, shape/strides stay NULL */
+    total_size = 1;
   }
 
-  /* Allocate and zero-initialize MKL memory */
+  /* 4. Allocate and zero-initialize MKL memory */
   arr->size = total_size;
   arr->dtype = dtype;
   arr->data = mkl_malloc(total_size * dtype->itemsize, 64);
   
   if (!arr->data) {
-    /* No manual free needed: Lua GC handles shape/strides on error */
     return luaL_error(L, "numlu: mkl_malloc failed for data");
   }
   
@@ -748,15 +774,25 @@ static int l_ndarray_tostring(lua_State* L) {
   
   luaL_Buffer b;
   luaL_buffinit(L, &b);
+  
+  /* Start building the string: numlu.ndarray<type>({shape}) */
   luaL_addstring(&b, "numlu.ndarray<");
   luaL_addstring(&b, arr->dtype->name);
   luaL_addstring(&b, ">({");
   
-  for (int i = 0; i < arr->ndims; i++) {
-    char dim[32];
-    sprintf_s(dim, sizeof(dim), "%zu", arr->shape[i]);
-    luaL_addstring(&b, dim);
-    if (i < arr->ndims - 1) luaL_addstring(&b, ", ");
+  /* 
+   * Only iterate if we have dimensions (ndims > 0) and a valid shape pointer.
+   * For 0-D arrays (scalars), this part is skipped, resulting in ({})
+   */
+  if (arr->ndims > 0 && arr->shape != NULL) {
+    for (int i = 0; i < arr->ndims; i++) {
+      char dim[32];
+      sprintf_s(dim, sizeof(dim), "%zu", arr->shape[i]);
+      luaL_addstring(&b, dim);
+      if (i < arr->ndims - 1) {
+        luaL_addstring(&b, ", ");
+      }
+    }
   }
   
   luaL_addstring(&b, "})");
