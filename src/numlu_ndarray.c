@@ -6,7 +6,8 @@
 #include <stdbool.h>
 
 /* Forward declaration */
-static int parse_slice_string(const char *s, long max_len, long *start, long *stop, long *step);
+static int parse_slice_string(const char *s, size_t max_len,
+			      long long *start, long long *stop, long long *step);
 
 /* Metatable name used by the lcomplex library */
 #define LCOMPLEX_METATABLE "complex number"
@@ -340,10 +341,11 @@ static int l_ndarray_len(lua_State* L) {
  * Helper function to parse a slicing string like "start:stop:step"
  * Returns SLICE_RANGE if it contains a colon, SLICE_SCALAR otherwise.
  */
-static slice_type parse_slice_string(const char *s, long max_len, long *start, long *stop, long *step) {
+static slice_type parse_slice_string(const char *s, size_t max_len, long long *start,
+				     long long *stop, long long *step) {
   /* Default values: full range with step 1 */
   *start = 1;
-  *stop = max_len;
+  *stop = (long long)max_len;
   *step = 1;
 
   /* Check for range indicator (colon) before parsing */
@@ -355,7 +357,7 @@ static slice_type parse_slice_string(const char *s, long max_len, long *start, l
   }
 
   /* sscanf_s returns the number of successfully filled variables */
-  int count = sscanf_s(s, "%ld:%ld:%ld", start, stop, step);
+  int count = sscanf_s(s, "%lld:%lld:%lld", start, stop, step);
   if (count < 1) return SLICE_INVALID;
 
   /* Prevent Division by Zero */
@@ -374,18 +376,18 @@ static slice_type parse_slice_string(const char *s, long max_len, long *start, l
 
   /* Handle negative indices for 'start' (Lua-stack style: -1 is last) */
   if (*start < 0) {
-    *start = max_len + *start + 1;
+    *start = (long long)max_len + *start + 1;
   }
     
   /* Handle negative indices for 'stop' */
   if (count >= 2 && *stop < 0) {
-    *stop = max_len + *stop + 1;
+    *stop = (long long)max_len + *stop + 1;
   }
 
   /* Bounds checking to prevent memory access errors */
   if (*start < 1) *start = 1;
-  if (*start > max_len) *start = max_len;
-  if (*start < 1 || *start > max_len || *stop > max_len) {
+  if (*start > (long long)max_len) *start = (long long)max_len;
+  if (*start < 1 || *start > (long long)max_len || *stop > (long long)max_len) {
     /* Indices must be within 1 and max_len
      * We could return SLICE_INVALID here, but a direct error message 
      * helps the user find the bug in their Lua code immediately. */
@@ -524,7 +526,7 @@ static int l_ndarray_call(lua_State* L) {
     for (int i = 0; i < (int)arr->ndims; i++) {
       if (i < total_args) {
         if (lua_type(L, i + 2) == LUA_TSTRING) {
-          long st, sp, sk;
+          long long st, sp, sk;
           if (parse_slice_string(lua_tostring(L, i + 2), arr->shape[i], &st, &sp, &sk) == SLICE_RANGE) {
             view_ndims++;
           }
@@ -569,7 +571,7 @@ static int l_ndarray_call(lua_State* L) {
     /* Step 3: Populate view metadata and calculate offset */
     int target_dim = 0;
     for (int i = 0; i < (int)arr->ndims; i++) {
-      long start, stop, step;
+      long long start, stop, step;
       slice_type stype = SLICE_INVALID;
 
       if (i < total_args) {
