@@ -172,6 +172,10 @@ static int l_ndarray_index(lua_State* L) {
     }
     return 1;
   }
+  if (strcmp(key, "is_view") == 0) {
+    lua_pushboolean(L, arr->is_view);
+    return 1;
+  }
   if (strcmp(key, "is_contiguous") == 0) {
     lua_pushboolean(L, numlu_is_contiguous(arr));
     return 1;
@@ -760,50 +764,39 @@ static int l_ndarray_tostring(lua_State* L) {
   return 1;
 }
 
-/* Method: arr:reshape({shape} | size) */
 static int l_ndarray_reshape(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
-
-  if (!numlu_is_contiguous(arr)) {
-    return luaL_error(L, "numlu: reshape without copy only possible for contiguous arrays");
-  }
-  
   int new_ndims = 0;
+  
+  /* 1. Determine new dimensionality */
   if (lua_isnumber(L, 2)) new_ndims = 1;
   else if (lua_istable(L, 2)) new_ndims = (int)lua_rawlen(L, 2);
   else return luaL_typeerror(L, 2, "number or table");
 
   if (new_ndims == 0) return luaL_error(L, "numlu: shape cannot be empty");
-  
-  /* Create the new View Userdata EARLY with 3 slots */
-  numlu_ndarray *view = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 3);
-  memset(view, 0, sizeof(numlu_ndarray));
-  luaL_getmetatable(L, "numlu.ndarray");
-  lua_setmetatable(L, -2);
 
-  /* Slot 1: Anchor owner */
-  if (arr->is_view) lua_getiuservalue(L, 1, 1);
-  else lua_pushvalue(L, 1);
-  lua_setiuservalue(L, -2, 1);
-
-  /* Slot 2 & 3: Allocate GC-managed metadata */
-  view->ndims = new_ndims;
-  view->shape = (size_t*)alloc_metadata_buffer(L, view->ndims, 2);
-  view->strides = (size_t*)alloc_metadata_buffer(L, view->ndims, 3);
+  /* 2. Check if we can stay as a View or must Copy */
+  bool needs_copy = !numlu_is_contiguous(arr);
   
-  /* Parse and Validate Shape directly into the view->shape buffer */
+  /* Create the result object (3 slots: Owner/DType, Shape, Strides) */
+  numlu_ndarray *res = (numlu_ndarray *)lua_newuserdatauv(L, sizeof(numlu_ndarray), 3);
+  memset(res, 0, sizeof(numlu_ndarray));
+  luaL_setmetatable(L, "numlu.ndarray");
+
+  /* Setup Metadata Buffers */
+  res->ndims = new_ndims;
+  res->shape = (size_t*)alloc_metadata_buffer(L, res->ndims, 2);
+  res->strides = (size_t*)alloc_metadata_buffer(L, res->ndims, 3);
+  res->dtype = arr->dtype;
+
+  /* 3. Parse Shape (Directly into res->shape) */
   int auto_dim_idx = -1;
   size_t product_other_dims = 1;
-
   if (lua_isnumber(L, 2)) {
     long dim = (long)luaL_checkinteger(L, 2);
-    if (dim == -1) view->shape[0] = arr->size;
-    else {
-      if (dim <= 0) return luaL_error(L, "numlu: size must be positive");
-      view->shape[0] = (size_t)dim;
-    }
-    product_other_dims = view->shape[0];
-  } 
+    res->shape[0] = (dim == -1) ? arr->size : (size_t)dim;
+    product_other_dims = res->shape[0];
+  }
   else {
     for (int i = 1; i <= new_ndims; i++) {
       lua_rawgeti(L, 2, i);
@@ -814,8 +807,8 @@ static int l_ndarray_reshape(lua_State* L) {
       }
       else {
         if (dim <= 0) return luaL_error(L, "numlu: dimensions must be positive");
-        view->shape[i-1] = (size_t)dim;
-        product_other_dims *= view->shape[i-1];
+        res->shape[i-1] = (size_t)dim;
+        product_other_dims *= res->shape[i-1];
       }
       lua_pop(L, 1);
     }
@@ -823,22 +816,48 @@ static int l_ndarray_reshape(lua_State* L) {
       if (arr->size % product_other_dims != 0)
         return luaL_error(L, "numlu: size %zu not divisible by product %zu",
 			  arr->size, product_other_dims);
-      view->shape[auto_dim_idx] = arr->size / product_other_dims;
-      product_other_dims *= view->shape[auto_dim_idx];
+      res->shape[auto_dim_idx] = arr->size / product_other_dims;
+      product_other_dims *= res->shape[auto_dim_idx];
     }
   }
-  
-  if (product_other_dims != arr->size) {
-    return luaL_error(L, "numlu: reshape total size mismatch");
-  }
 
-  /* Finalize properties */
-  calc_strides_row_major(view->ndims, view->shape, view->strides);
-  view->data = arr->data;
-  view->dtype = arr->dtype;
-  view->size = arr->size;
-  view->is_view = 1;
-  view->offset = arr->offset;
+  if (product_other_dims != arr->size) 
+    return luaL_error(L, "numlu: reshape size mismatch");
+
+  calc_strides_row_major(res->ndims, res->shape, res->strides);
+  res->size = arr->size;
+
+  /* 4. Handle Data: VIEW vs COPY */
+  if (!needs_copy) {
+    /* CASE A: Contiguous -> Create View */
+    res->is_view = 1;
+    res->data = arr->data;
+    res->offset = arr->offset;
+    /* Anchor original owner in Slot 1 */
+    if (arr->is_view) lua_getiuservalue(L, 1, 1);
+    else lua_pushvalue(L, 1);
+    lua_setiuservalue(L, -2, 1);
+  } 
+  else {
+    /* CASE B: Non-Contiguous -> Perform Deep Copy to new MKL block */
+    res->is_view = 0;
+    res->offset = 0;
+    res->data = mkl_malloc(res->size * res->dtype->itemsize, 64);
+    if (!res->data) return luaL_error(L, "numlu: mkl_malloc failed for reshape copy");
+
+    /* Anchor DType in Slot 1 (since res is now a fresh owner) */
+    numlu_push_dtype(L, res->dtype);
+    lua_setiuservalue(L, -2, 1);
+
+    /* Performance Note: For now, we do a simple element-by-element copy. 
+       In the future, we could optimize this for specific stride patterns. */
+    for (size_t i = 0; i < res->size; i++) {
+      size_t src_offset = get_flat_offset(arr, i);
+      memcpy((char*)res->data + (i * res->dtype->itemsize),
+             (char*)arr->data + (src_offset * res->dtype->itemsize),
+             res->dtype->itemsize);
+    }
+  }
 
   return 1;
 }
