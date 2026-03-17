@@ -11,6 +11,17 @@ local function assert_eq(actual, expected, msg)
    end
 end
 
+-- Helper to ensure a specific call fails (NumPy-conformity check)
+local function assert_error(fn, msg)
+   local ok, err = pcall(fn)
+   if ok then
+      error(string.format("\n[FAIL] %s (Should have thrown an error but didn't)", msg))
+   else
+      -- Optional: print(string.format("[DEBUG] Caught expected error: %s", err))
+      print("[PASS] " .. msg .. " (Caught expected error)")
+   end
+end
+
 print("--- Test 1: Multi-Dimensional Creation ---")
 local matrix = numlu.zeros({3, 4}, numlu.float64)
 assert_eq(matrix.ndims, 2, "Matrix ndims is 2")
@@ -65,29 +76,37 @@ assert_eq(val12:imag(), -2.0, "Complex (1,2) imag part")
 assert_eq(val22:real(), 10.5, "Complex (2,2) auto-conversion from real")
 assert_eq(val22:imag(), 0.0, "Complex (2,2) imag part is zero")
 
-print("\n--- Test 7: Scalar (0-D) Arrays ---")
--- 1. Create a 0-D array (scalar) using an empty table
+print("\n--- Test 7: Scalar (0-D) Arrays (NumPy-Conformity) ---")
 local scalar = numlu.zeros({}, "float64")
 assert_eq(scalar.ndims, 0, "Scalar ndims is 0")
 assert_eq(scalar.size, 1, "Scalar size is 1")
 assert_eq(#scalar.shape, 0, "Scalar shape is an empty table")
-assert_eq(#scalar, 0, "Length operator (#scalar) is 0")
 
--- 2. Access and modify the single value
--- Use flat indexing [1] or () for the single element
-scalar[1] = 42.5
-assert_eq(scalar[1], 42.5, "Scalar access via flat index [1]")
+-- 1. Test: Length operator must fail on 0-D (NumPy len() behavior)
+assert_error(function() return #scalar end, "Length operator (#) on 0-D array must fail")
 
--- 3. ToString representation
+-- 2. Test: Indexing must fail on 0-D (NumPy indexing behavior)
+assert_error(function() return scalar[1] end, "Indexing scalar via [] must fail")
+
+-- 3. Test: Call indexing must fail on 0-D
+assert_error(function() return scalar(1) end, "Calling scalar(1) must fail")
+
+-- 4. Test: Correct value access (Scalars can be accessed via :at(1) for testing)
+scalar:at(1, 42.5)
+assert_eq(scalar:at(1), 42.5, "Scalar access via :at(1)")
+
+-- 5. ToString representation
 local s_str = tostring(scalar)
-local expected_str = "numlu.ndarray<float64>({})"
-local match = (s_str == expected_str)
-assert_eq(match, true, "Scalar tostring representation (Actual: " .. s_str .. ")")
+assert_eq(s_str, "numlu.ndarray<float64>({})", "Scalar tostring representation")
 
--- 4. Complex Scalar
+-- 6. Complex Scalar (NumPy-conform access via method)
 local c_scalar = numlu.zeros({}, "complex128")
-c_scalar[1] = complex.new(1, 2)
-assert_eq(c_scalar[1]:real(), 1.0, "Complex scalar real part")
-assert_eq(c_scalar[1]:imag(), 2.0, "Complex scalar imag part")
+c_scalar:at(1, complex.new(1, 2))
+local c_val = c_scalar:at(1)
+assert_eq(c_val:real(), 1.0, "Complex scalar real part")
+assert_eq(c_val:imag(), 2.0, "Complex scalar imag part")
+
+-- 7. Verify indexing error for complex scalar as well
+assert_error(function() return c_scalar[1] end, "Indexing complex scalar via [] must fail")
 
 print("\n--- ALL BASE TESTS PASSED ---")

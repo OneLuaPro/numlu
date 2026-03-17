@@ -125,6 +125,11 @@ static int l_ndarray_index(lua_State* L) {
 
   /* CASE A: Numeric Index -> arr[i] */
   if (lua_isnumber(L, 2)) {
+    /* NumPy-conformity: 0-D arrays (scalars) cannot be indexed */
+    if (arr->ndims == 0) {
+      return luaL_error(L, "IndexError: too many indices for array: array is 0nd-dimensional");
+    }
+
     lua_Integer idx = lua_tointeger(L, 2);
     
     /* Bounds check (1-based) */
@@ -318,19 +323,27 @@ static int l_ndarray_at(lua_State* L) {
   return 0;
 }
 
-/* Length operator (#arr): returns the size of the first dimension */
+/* Length operator (#arr): Returns the size of the first dimension */
 static int l_ndarray_len(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
   
   /* 
-   * Check if we have at least one dimension and a valid shape pointer.
-   * For 0-D arrays (scalars), shape is NULL and ndims is 0, so we return 0.
+   * NumPy-conformity: 0-D arrays (scalars) do not have a length.
+   * Calling len() on a scalar in Python raises a TypeError.
    */
-  if (arr->ndims > 0 && arr->shape != NULL) {
+  if (arr->ndims == 0) {
+    return luaL_error(L, "TypeError: len() of unsized object (0-D array)");
+  }
+
+  /* 
+   * Return the size of the first dimension. 
+   * For N-D arrays where N > 0, shape[0] is the correct length.
+   */
+  if (arr->shape != NULL) {
     lua_pushinteger(L, (lua_Integer)arr->shape[0]);
   }
   else {
-    /* Scalars and empty-defined arrays have a length of 0 in the first dim */
+    /* Safety fallback: if ndims > 0 but shape is unexpectedly NULL */
     lua_pushinteger(L, 0);
   }
   
@@ -477,6 +490,11 @@ int l_ndarray_new(lua_State* L) {
 static int l_ndarray_call(lua_State* L) {
   numlu_ndarray* arr = luaL_checkudata(L, 1, "numlu.ndarray");
   int total_args = lua_gettop(L) - 1; /* Total arguments provided in Lua */
+
+  /* NumPy-conformity: 0-D arrays cannot be indexed/called with indices */
+  if (arr->ndims == 0) {
+    return luaL_error(L, "IndexError: too many indices for array: array is 0nd-dimensional");
+  }
 
   /* Ensure stack space for N-dimensional metadata + overhead */
   luaL_checkstack(L, total_args + 10, "numlu: too many dimensions for stack");
